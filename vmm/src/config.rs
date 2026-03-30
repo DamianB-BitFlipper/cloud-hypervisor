@@ -2190,7 +2190,7 @@ impl DebugConsoleConfig {
 }
 
 impl DeviceConfig {
-    pub const SYNTAX: &'static str = "Direct device assignment parameters \"path=<device_path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>\"";
+    pub const SYNTAX: &'static str = "Direct device assignment parameters \"path=<device_path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>,x_nv_gpudirect_clique=<clique_id>,x_no_mmap=on|off\"";
 
     pub fn parse(device: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2199,7 +2199,8 @@ impl DeviceConfig {
             .add("id")
             .add("iommu")
             .add("pci_segment")
-            .add("x_nv_gpudirect_clique");
+            .add("x_nv_gpudirect_clique")
+            .add("x_no_mmap");
         parser.parse(device).map_err(Error::ParseDevice)?;
 
         let path = parser
@@ -2219,12 +2220,18 @@ impl DeviceConfig {
         let x_nv_gpudirect_clique = parser
             .convert::<u8>("x_nv_gpudirect_clique")
             .map_err(Error::ParseDevice)?;
+        let x_no_mmap = parser
+            .convert::<Toggle>("x_no_mmap")
+            .map_err(Error::ParseDevice)?
+            .unwrap_or(Toggle(false))
+            .0;
         Ok(DeviceConfig {
             path,
             iommu,
             id,
             pci_segment,
             x_nv_gpudirect_clique,
+            x_no_mmap,
         })
     }
 
@@ -4334,6 +4341,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             iommu: false,
             pci_segment: 0,
             x_nv_gpudirect_clique: None,
+            x_no_mmap: false,
         }
     }
 
@@ -4359,6 +4367,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             DeviceConfig {
                 id: Some("mydevice0".to_owned()),
                 iommu: true,
+                ..device_fixture()
+            }
+        );
+
+        assert_eq!(
+            DeviceConfig::parse("path=/path/to/device,x_no_mmap=on")?,
+            DeviceConfig {
+                x_no_mmap: true,
                 ..device_fixture()
             }
         );

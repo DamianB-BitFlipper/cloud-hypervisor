@@ -3945,6 +3945,7 @@ impl DeviceManager {
             memory_manager.lock().unwrap().memory_slot_allocator(),
             vm_migration::snapshot_from_id(self.snapshot.as_ref(), vfio_name.as_str()),
             device_cfg.x_nv_gpudirect_clique,
+            device_cfg.x_no_mmap,
             device_cfg.path.clone(),
         )
         .map_err(DeviceManagerError::VfioPciCreate)?;

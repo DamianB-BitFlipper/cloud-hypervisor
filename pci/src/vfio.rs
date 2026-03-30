@@ -493,6 +493,7 @@ pub(crate) struct VfioCommon {
     pub(crate) vfio_wrapper: Arc<dyn Vfio>,
     pub(crate) patches: HashMap<usize, ConfigPatch>,
     x_nv_gpudirect_clique: Option<u8>,
+    x_no_mmap: bool,
 }
 
 impl VfioCommon {
@@ -504,6 +505,7 @@ impl VfioCommon {
         bdf: PciBdf,
         snapshot: Option<&Snapshot>,
         x_nv_gpudirect_clique: Option<u8>,
+        x_no_mmap: bool,
     ) -> Result<Self, VfioPciError> {
         let pci_configuration_state = vm_migration::state_from_id(snapshot, PCI_CONFIGURATION_ID)
             .map_err(|e| {
@@ -539,6 +541,7 @@ impl VfioCommon {
             vfio_wrapper,
             patches: HashMap::new(),
             x_nv_gpudirect_clique,
+            x_no_mmap,
         };
 
         let state: Option<VfioCommonState> = snapshot
@@ -1489,6 +1492,7 @@ impl VfioPciDevice {
         memory_slot_allocator: MemorySlotAllocator,
         snapshot: Option<&Snapshot>,
         x_nv_gpudirect_clique: Option<u8>,
+        x_no_mmap: bool,
         device_path: PathBuf,
     ) -> Result<Self, VfioPciError> {
         let device = Arc::new(device);
@@ -1504,6 +1508,7 @@ impl VfioPciDevice {
             bdf,
             vm_migration::snapshot_from_id(snapshot, VFIO_COMMON_ID),
             x_nv_gpudirect_clique,
+            x_no_mmap,
         )?;
 
         let vfio_pci_device = VfioPciDevice {
@@ -1634,6 +1639,16 @@ impl VfioPciDevice {
     ///   as user memory regions.
     /// * `mem_slot` - The closure to return a memory slot.
     pub fn map_mmio_regions(&mut self) -> Result<(), VfioPciError> {
+        if self.common.x_no_mmap {
+            info!(
+                "Skipping VFIO BAR mmap for device {} at {} ({} MMIO regions)",
+                self.bdf,
+                self.device_path.display(),
+                self.common.mmio_regions.len()
+            );
+            return Ok(());
+        }
+
         let fd = self.device.as_raw_fd();
         // SAFETY: fd is guaranteed valid
         let fd = unsafe { BorrowedFd::borrow_raw(fd) };

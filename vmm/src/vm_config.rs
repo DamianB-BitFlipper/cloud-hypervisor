@@ -612,6 +612,8 @@ pub struct DeviceConfig {
     pub pci_segment: u16,
     #[serde(default)]
     pub x_nv_gpudirect_clique: Option<u8>,
+    #[serde(default)]
+    pub x_no_mmap: bool,
 }
 
 impl ApplyLandlock for DeviceConfig {

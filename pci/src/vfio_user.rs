@@ -102,6 +102,7 @@ impl VfioUserPciDevice {
             bdf,
             vm_migration::snapshot_from_id(snapshot, VFIO_COMMON_ID),
             None,
+            false,
         )
         .map_err(VfioUserPciDeviceError::CreateVfioCommon)?;
 
