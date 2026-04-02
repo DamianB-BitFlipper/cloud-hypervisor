@@ -4564,7 +4564,6 @@ mod common_parallel {
     #[test]
     fn test_virtio_block_sparse_off_qcow2() {
         const TEST_DISK_SIZE: &str = "2G";
-        const CLUSTER_SIZE_BYTES: u64 = 64 * 1024;
 
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
@@ -4618,37 +4617,36 @@ mod common_parallel {
                 1
             );
 
-            let mut current_offset_kb = 1024;
+            // With sparse=off, DISCARD should NOT be advertised.
+            // blkdiscard is expected to fail.
+            let discard_result =
+                guest.ssh_command("sudo blkdiscard -o 1048576 -l 1048576 /dev/vdc 2>&1; echo $?");
+            let exit_code = discard_result
+                .unwrap()
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or("1")
+                .parse::<u32>()
+                .unwrap_or(1);
+            assert_ne!(
+                exit_code, 0,
+                "blkdiscard should fail with sparse=off (DISCARD not advertised)"
+            );
 
-            for &size_kb in BLOCK_DISCARD_TEST_SIZES_KB.iter() {
-                guest
-                    .ssh_command(&format!(
-                        "sudo dd if=/dev/urandom of=/dev/vdc bs=1K count={size_kb} seek={current_offset_kb} oflag=direct"
-                    ))
-                    .unwrap();
+            // WRITE_ZEROES should still work via blkdiscard --zeroout
+            guest
+                .ssh_command(
+                    "sudo dd if=/dev/urandom of=/dev/vdc bs=1K count=64 seek=1024 oflag=direct",
+                )
+                .unwrap();
+            guest.ssh_command("sync").unwrap();
+            guest
+                .ssh_command("sudo blkdiscard -z -o 1048576 -l 65536 /dev/vdc")
+                .unwrap();
+            guest.ssh_command("sync").unwrap();
 
-                guest.ssh_command("sync").unwrap();
-
-                guest
-                    .ssh_command(&format!(
-                        "sudo blkdiscard -o {} -l {} /dev/vdc",
-                        current_offset_kb * 1024,
-                        size_kb * 1024
-                    ))
-                    .unwrap();
-
-                guest.ssh_command("sync").unwrap();
-
-                // Verify VM sees zeros in discarded region
-                assert_guest_disk_region_is_zero(
-                    &guest,
-                    "/dev/vdc",
-                    current_offset_kb * 1024,
-                    size_kb * 1024,
-                );
-
-                current_offset_kb += size_kb + 64;
-            }
+            assert_guest_disk_region_is_zero(&guest, "/dev/vdc", 1048576, 65536);
         });
 
         kill_child(&mut child);
@@ -4659,9 +4657,10 @@ mod common_parallel {
 
         handle_child_output(r, &output);
 
+        // WRITE_ZEROES should still produce zero-flagged regions
         assert!(
             zero_regions_after > zero_regions_before,
-            "Expected zero-flagged regions to increase with sparse=off: before={zero_regions_before}, after={zero_regions_after}"
+            "Expected zero-flagged regions to increase via WRITE_ZEROES: before={zero_regions_before}, after={zero_regions_after}"
         );
 
         disk_check_consistency(test_disk_path, None);
@@ -10063,6 +10062,177 @@ mod live_migration {
         handle_child_output(r, &src_output);
     }
 
+    fn _test_live_migration_virtio_fs(local: bool) {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let kernel_path = direct_kernel_boot_path();
+
+        let mut workload_path = dirs::home_dir().unwrap();
+        workload_path.push("workloads");
+        let mut shared_dir = workload_path;
+        shared_dir.push("shared_dir");
+
+        let (daemon_child, virtiofsd_socket_path) =
+            prepare_virtiofsd(&guest.tmp_dir, shared_dir.to_str().unwrap());
+
+        let src_api_socket = temp_api_path(&guest.tmp_dir);
+
+        // Start the source VM
+        let mut src_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &src_api_socket])
+            .args(["--cpus", "boot=2"])
+            .args(["--memory", "size=512M,shared=on"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .default_disks()
+            .default_net()
+            .args([
+                "--fs",
+                format!("socket={virtiofsd_socket_path},tag=myfs,num_queues=1,queue_size=1024")
+                    .as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        // Start the destination VM
+        let mut dest_api_socket = temp_api_path(&guest.tmp_dir);
+        dest_api_socket.push_str(".dest");
+        let mut dest_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &dest_api_socket])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        // Spawn a thread that waits for the old virtiofsd to exit then
+        // starts a replacement.  During migration the source saves
+        // DEVICE_STATE then disconnects, causing virtiofsd to exit.
+        // The destination needs a fresh virtiofsd to load DEVICE_STATE.
+        // We remove the socket file first so the destination cannot
+        // accidentally connect to the old instance.
+        let virtiofsd_socket_clone = virtiofsd_socket_path.clone();
+        let shared_dir_str = shared_dir.to_str().unwrap().to_string();
+        let (restart_tx, restart_rx) = std::sync::mpsc::channel();
+        let _monitor = thread::spawn(move || {
+            let mut child = daemon_child;
+            let _ = child.wait();
+            let mut path = dirs::home_dir().unwrap();
+            path.push("workloads");
+            path.push("virtiofsd");
+            let new_child = Command::new(path)
+                .args(["--shared-dir", &shared_dir_str])
+                .args(["--socket-path", &virtiofsd_socket_clone])
+                .args(["--cache", "never"])
+                .args(["--tag", "myfs"])
+                .spawn()
+                .unwrap();
+            wait_for_virtiofsd_socket(&virtiofsd_socket_clone);
+            let _ = restart_tx.send(new_child);
+        });
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            // Mount virtiofs and verify it works
+            guest
+                .ssh_command("mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir/")
+                .unwrap();
+
+            // Write a test file through virtiofs before migration
+            guest
+                .ssh_command(
+                    "sudo bash -c 'echo pre_migration_data > mount_dir/migration_test_file'",
+                )
+                .unwrap();
+
+            // Verify the file is accessible
+            assert_eq!(
+                guest
+                    .ssh_command("cat mount_dir/migration_test_file")
+                    .unwrap()
+                    .trim(),
+                "pre_migration_data"
+            );
+
+            let migration_socket = String::from(
+                guest
+                    .tmp_dir
+                    .as_path()
+                    .join("live-migration.sock")
+                    .to_str()
+                    .unwrap(),
+            );
+
+            // Remove the socket so the destination cannot connect to
+            // the old virtiofsd (which is still running).  The source's
+            // existing connection uses an already-accepted fd.
+            let _ = std::fs::remove_file(&virtiofsd_socket_path);
+
+            assert!(
+                start_live_migration(&migration_socket, &src_api_socket, &dest_api_socket, local),
+                "Unsuccessful command: 'send-migration' or 'receive-migration'."
+            );
+        });
+
+        // Check and report any errors occurred during the live-migration
+        if r.is_err() {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Error occurred during live-migration with virtio-fs",
+            );
+        }
+
+        // Check the source vm has been terminated successfully (give it '3s' to settle)
+        thread::sleep(Duration::from_secs(3));
+        if !src_child.try_wait().unwrap().is_some_and(|s| s.success()) {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "source VM was not terminated successfully.",
+            );
+        }
+
+        // Post live-migration checks
+        let r = std::panic::catch_unwind(|| {
+            // Verify virtiofs still works after migration
+            // Read the file written before migration
+            assert_eq!(
+                guest
+                    .ssh_command("cat mount_dir/migration_test_file")
+                    .unwrap()
+                    .trim(),
+                "pre_migration_data"
+            );
+
+            // Write a new file after migration
+            guest
+                .ssh_command(
+                    "sudo bash -c 'echo post_migration_data > mount_dir/post_migration_file'",
+                )
+                .unwrap();
+
+            // Verify the new file exists on the host
+            let post_content =
+                std::fs::read_to_string(shared_dir.join("post_migration_file")).unwrap();
+            assert_eq!(post_content.trim(), "post_migration_data");
+        });
+
+        // Clean up
+        let _ = dest_child.kill();
+        let dest_output = dest_child.wait_with_output().unwrap();
+        if let Ok(mut new_daemon) = restart_rx.try_recv() {
+            let _ = new_daemon.kill();
+            let _ = new_daemon.wait();
+        }
+        let _ = std::fs::remove_file(shared_dir.join("migration_test_file"));
+        let _ = std::fs::remove_file(shared_dir.join("post_migration_file"));
+
+        handle_child_output(r, &dest_output);
+    }
+
     mod live_migration_parallel {
         use vmm::api::TimeoutStrategy;
 
@@ -10135,7 +10305,19 @@ mod live_migration {
     mod live_migration_sequential {
         use super::*;
 
-        // NUMA & balloon live migration tests are large so run sequentially
+        // NUMA, balloon, and virtio-fs live migration tests run sequentially
+
+        #[test]
+        #[cfg(not(feature = "mshv"))]
+        fn test_live_migration_virtio_fs() {
+            _test_live_migration_virtio_fs(false);
+        }
+
+        #[test]
+        #[cfg(not(feature = "mshv"))]
+        fn test_live_migration_virtio_fs_local() {
+            _test_live_migration_virtio_fs(true);
+        }
 
         #[test]
         fn test_live_migration_balloon() {
@@ -10293,6 +10475,10 @@ mod aarch64_acpi {
 mod rate_limiter {
     use super::*;
 
+    const NET_RATE_LIMITER_RUNTIME: u32 = 20;
+    const BLOCK_RATE_LIMITER_RUNTIME: u32 = 20;
+    const BLOCK_RATE_LIMITER_RAMP_TIME: u32 = 5;
+
     // Check if the 'measured' rate is within the expected 'difference' (in percentage)
     // compared to given 'limit' rate.
     fn check_rate_limit(measured: f64, limit: f64, difference: f64) -> bool {
@@ -10316,15 +10502,14 @@ mod rate_limiter {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
 
-        let test_timeout = 10;
         let num_queues = 2;
         let queue_size = 256;
-        let bw_size = 10485760_u64; // bytes
-        let bw_refill_time = 100; // ms
+        let bw_size = 104857600_u64; // bytes
+        let bw_refill_time = 1000; // ms
         let limit_bps = (bw_size * 8 * 1000) as f64 / bw_refill_time as f64;
 
         let net_params = format!(
-            "tap=,mac={},ip={},mask=255.255.255.128,num_queues={},queue_size={},bw_size={},bw_refill_time={}",
+            "tap=,mac={},ip={},mask=255.255.255.128,num_queues={},queue_size={},bw_size={},bw_one_time_burst=0,bw_refill_time={}",
             guest.network.guest_mac0,
             guest.network.host_ip0,
             num_queues,
@@ -10346,9 +10531,14 @@ mod rate_limiter {
 
         let r = std::panic::catch_unwind(|| {
             guest.wait_vm_boot().unwrap();
-            let measured_bps =
-                measure_virtio_net_throughput(test_timeout, num_queues / 2, &guest, rx, true)
-                    .unwrap();
+            let measured_bps = measure_virtio_net_throughput(
+                NET_RATE_LIMITER_RUNTIME,
+                num_queues / 2,
+                &guest,
+                rx,
+                true,
+            )
+            .unwrap();
             assert!(check_rate_limit(measured_bps, limit_bps, 0.1));
         });
 
@@ -10368,15 +10558,14 @@ mod rate_limiter {
     }
 
     fn _test_rate_limiter_block(bandwidth: bool, num_queues: u32) {
-        let test_timeout = 10;
         let fio_ops = FioOps::RandRW;
 
         let bw_size = if bandwidth {
-            10485760_u64 // bytes
+            104857600_u64 // bytes
         } else {
-            100_u64 // I/O
+            1000_u64 // I/O
         };
-        let bw_refill_time = 100; // ms
+        let bw_refill_time = 1000; // ms
         let limit_rate = (bw_size * 1000) as f64 / bw_refill_time as f64;
 
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
@@ -10397,11 +10586,11 @@ mod rate_limiter {
 
         let test_blk_params = if bandwidth {
             format!(
-                "path={blk_rate_limiter_test_img},num_queues={num_queues},bw_size={bw_size},bw_refill_time={bw_refill_time},image_type=raw"
+                "path={blk_rate_limiter_test_img},num_queues={num_queues},bw_size={bw_size},bw_one_time_burst=0,bw_refill_time={bw_refill_time},image_type=raw"
             )
         } else {
             format!(
-                "path={blk_rate_limiter_test_img},num_queues={num_queues},ops_size={bw_size},ops_refill_time={bw_refill_time},image_type=raw"
+                "path={blk_rate_limiter_test_img},num_queues={num_queues},ops_size={bw_size},ops_one_time_burst=0,ops_refill_time={bw_refill_time},image_type=raw"
             )
         };
 
@@ -10436,7 +10625,8 @@ mod rate_limiter {
             let fio_command = format!(
                 "sudo fio --filename=/dev/vdc --name=test --output-format=json \
                 --direct=1 --bs=4k --ioengine=io_uring --iodepth=64 \
-                --rw={fio_ops} --runtime={test_timeout} --numjobs={num_queues}"
+                --rw={fio_ops} --runtime={BLOCK_RATE_LIMITER_RUNTIME} \
+                --ramp_time={BLOCK_RATE_LIMITER_RAMP_TIME} --numjobs={num_queues}",
             );
             let output = guest.ssh_command(&fio_command).unwrap();
 
@@ -10455,15 +10645,14 @@ mod rate_limiter {
     }
 
     fn _test_rate_limiter_group_block(bandwidth: bool, num_queues: u32, num_disks: u32) {
-        let test_timeout = 10;
         let fio_ops = FioOps::RandRW;
 
         let bw_size = if bandwidth {
-            10485760_u64 // bytes
+            104857600_u64 // bytes
         } else {
-            100_u64 // I/O
+            1000_u64 // I/O
         };
-        let bw_refill_time = 100; // ms
+        let bw_refill_time = 1000; // ms
         let limit_rate = (bw_size * 1000) as f64 / bw_refill_time as f64;
 
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
@@ -10472,9 +10661,13 @@ mod rate_limiter {
         let test_img_dir = TempDir::new_with_prefix("/var/tmp/ch").unwrap();
 
         let rate_limit_group_arg = if bandwidth {
-            format!("id=group0,bw_size={bw_size},bw_refill_time={bw_refill_time}")
+            format!(
+                "id=group0,bw_size={bw_size},bw_one_time_burst=0,bw_refill_time={bw_refill_time}"
+            )
         } else {
-            format!("id=group0,ops_size={bw_size},ops_refill_time={bw_refill_time}")
+            format!(
+                "id=group0,ops_size={bw_size},ops_one_time_burst=0,ops_refill_time={bw_refill_time}"
+            )
         };
 
         let mut disk_args = vec![
@@ -10530,7 +10723,8 @@ mod rate_limiter {
             let mut fio_command = format!(
                 "sudo fio --name=global --output-format=json \
                 --direct=1 --bs=4k --ioengine=io_uring --iodepth=64 \
-                --rw={fio_ops} --runtime={test_timeout} --numjobs={num_queues}"
+                --rw={fio_ops} --runtime={BLOCK_RATE_LIMITER_RUNTIME} \
+                --ramp_time={BLOCK_RATE_LIMITER_RAMP_TIME} --numjobs={num_queues}",
             );
 
             // Generate additional argument for each disk:

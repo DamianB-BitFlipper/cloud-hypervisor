@@ -2637,16 +2637,16 @@ impl Pausable for CpuManager {
         self.signal_vcpus()
             .map_err(|e| MigratableError::Pause(anyhow!("Error signalling vCPUs: {e}")))?;
 
+        // Notify all guests (including Hyper-V / Windows) that the clock was
+        // paused.  KVM_KVMCLOCK_CTRL updates internal KVM state that affects
+        // both pvclock (Linux) and the Hyper-V TSC reference page, so it must
+        // be called unconditionally.
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         for vcpu in self.vcpus.iter() {
             let vcpu = vcpu.lock().unwrap();
-            if !self.config.kvm_hyperv {
-                vcpu.vcpu.notify_guest_clock_paused().map_err(|e| {
-                    MigratableError::Pause(anyhow!(
-                        "Could not notify guest it has been paused {e:?}"
-                    ))
-                })?;
-            }
+            vcpu.vcpu.notify_guest_clock_paused().map_err(|e| {
+                MigratableError::Pause(anyhow!("Could not notify guest it has been paused {e:?}"))
+            })?;
         }
 
         // The vCPU thread will change its paused state before parking, wait here for each
@@ -2762,7 +2762,7 @@ impl Debuggable for CpuManager {
         ];
 
         // GDB exposes 32-bit eflags instead of 64-bit rflags.
-        // https://github.com/bminor/binutils-gdb/blob/master/gdb/features/i386/64bit-core.xml
+        // https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=gdb/features/i386/64bit-core.xml
         let eflags = gregs.get_rflags() as u32;
         let rip = gregs.get_rip();
 

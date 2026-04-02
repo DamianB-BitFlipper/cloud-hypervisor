@@ -7,45 +7,74 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::BlockBackend;
-use crate::async_io::{
-    AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFile, DiskFileError, DiskFileResult,
-};
+use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
+use crate::error::{BlockError, BlockErrorKind, BlockResult, ErrorOp};
 use crate::fixed_vhd::FixedVhd;
 use crate::raw_sync::RawFileSync;
+use crate::{BlockBackend, disk_file};
 
+#[derive(Debug)]
 pub struct FixedVhdDiskSync(FixedVhd);
 
 impl FixedVhdDiskSync {
-    pub fn new(file: File) -> std::io::Result<Self> {
-        Ok(Self(FixedVhd::new(file)?))
+    pub fn new(file: File) -> BlockResult<Self> {
+        Ok(Self(
+            FixedVhd::new(file).map_err(|e| BlockError::from(e).with_op(ErrorOp::Open))?,
+        ))
     }
 }
 
-impl DiskFile for FixedVhdDiskSync {
-    fn logical_size(&mut self) -> DiskFileResult<u64> {
+impl disk_file::DiskSize for FixedVhdDiskSync {
+    fn logical_size(&self) -> BlockResult<u64> {
         Ok(self.0.logical_size().unwrap())
     }
+}
 
-    fn physical_size(&mut self) -> DiskFileResult<u64> {
-        self.0.physical_size().map_err(|e| {
-            let io_inner = match e {
-                crate::Error::GetFileMetadata(e) => e,
-                _ => unreachable!(),
-            };
-            DiskFileError::Size(io_inner)
+impl disk_file::PhysicalSize for FixedVhdDiskSync {
+    fn physical_size(&self) -> BlockResult<u64> {
+        self.0.physical_size().map_err(|e| match e {
+            crate::Error::GetFileMetadata(io) => {
+                BlockError::new(BlockErrorKind::Io, crate::Error::GetFileMetadata(io))
+            }
+            _ => BlockError::new(BlockErrorKind::Io, e),
         })
     }
+}
 
-    fn new_async_io(&self, _ring_depth: u32) -> DiskFileResult<Box<dyn AsyncIo>> {
-        Ok(Box::new(
-            FixedVhdSync::new(self.0.as_raw_fd(), self.0.logical_size().unwrap())
-                .map_err(DiskFileError::NewAsyncIo)?,
-        ) as Box<dyn AsyncIo>)
+impl disk_file::DiskFd for FixedVhdDiskSync {
+    fn fd(&self) -> BorrowedDiskFd<'_> {
+        BorrowedDiskFd::new(self.0.as_raw_fd())
+    }
+}
+
+impl disk_file::Geometry for FixedVhdDiskSync {}
+
+impl disk_file::SparseCapable for FixedVhdDiskSync {}
+
+impl disk_file::Resizable for FixedVhdDiskSync {
+    fn resize(&mut self, _size: u64) -> BlockResult<()> {
+        Err(BlockError::new(
+            BlockErrorKind::UnsupportedFeature,
+            DiskFileError::ResizeError(std::io::Error::other("resize not supported for fixed VHD")),
+        )
+        .with_op(ErrorOp::Resize))
+    }
+}
+
+impl disk_file::DiskFile for FixedVhdDiskSync {}
+
+impl disk_file::AsyncDiskFile for FixedVhdDiskSync {
+    fn try_clone(&self) -> BlockResult<Box<dyn disk_file::AsyncDiskFile>> {
+        Ok(Box::new(FixedVhdDiskSync(self.0.clone())))
     }
 
-    fn fd(&mut self) -> BorrowedDiskFd<'_> {
-        BorrowedDiskFd::new(self.0.as_raw_fd())
+    fn new_async_io(&self, _ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>> {
+        Ok(Box::new(
+            FixedVhdSync::new(self.0.as_raw_fd(), self.0.logical_size().unwrap()).map_err(|e| {
+                BlockError::new(BlockErrorKind::Io, DiskFileError::NewAsyncIo(e))
+                    .with_op(ErrorOp::Open)
+            })?,
+        ))
     }
 }
 

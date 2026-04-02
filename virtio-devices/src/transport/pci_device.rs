@@ -45,7 +45,7 @@ use crate::{
 };
 
 /// Vector value used to disable MSI for a queue.
-const VIRTQ_MSI_NO_VECTOR: u16 = 0xffff;
+pub(super) const VIRTQ_MSI_NO_VECTOR: u16 = 0xffff;
 
 enum PciCapabilityType {
     Common = 1,
@@ -978,7 +978,7 @@ impl PciDevice for VirtioPciDevice {
 
     fn allocate_bars(
         &mut self,
-        _allocator: &Arc<Mutex<SystemAllocator>>,
+        _allocator: &mut SystemAllocator,
         mmio32_allocator: &mut AddressAllocator,
         mmio64_allocator: &mut AddressAllocator,
         resources: Option<Vec<Resource>>,

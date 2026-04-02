@@ -1,11 +1,11 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
+use std::{io, thread};
 
 use anyhow::anyhow;
 use log::error;
@@ -29,7 +29,7 @@ use crate::{
     ActivateError, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
     GuestMemoryMmap, GuestRegionMmap, VIRTIO_F_IN_ORDER, VIRTIO_F_NOTIFICATION_DATA,
     VIRTIO_F_ORDER_PLATFORM, VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_RING_INDIRECT_DESC,
-    VIRTIO_F_VERSION_1, VirtioInterrupt,
+    VIRTIO_F_VERSION_1, VirtioCommon, VirtioInterrupt,
 };
 
 pub mod blk;
@@ -167,7 +167,8 @@ pub const DEFAULT_VIRTIO_FEATURES: u64 = (1 << VIRTIO_F_RING_INDIRECT_DESC)
     | (1 << VIRTIO_F_IN_ORDER)
     | (1 << VIRTIO_F_ORDER_PLATFORM)
     | (1 << VIRTIO_F_NOTIFICATION_DATA)
-    | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+    | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+    | VhostUserVirtioFeatures::LOG_ALL.bits();
 
 const HUP_CONNECTION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 const BACKEND_REQ_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
@@ -336,6 +337,7 @@ impl<C> VhostUserState<C> {
 
 #[derive(Default)]
 pub struct VhostUserCommon {
+    pub virtio_common: VirtioCommon,
     pub vu: Option<Arc<Mutex<VhostUserHandle>>>,
     pub acked_protocol_features: u64,
     pub socket_path: String,
@@ -344,6 +346,7 @@ pub struct VhostUserCommon {
     pub server: bool,
     pub interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
     pub vring_bases: Option<Vec<u64>>,
+    pub epoll_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl VhostUserCommon {
@@ -423,6 +426,22 @@ impl VhostUserCommon {
     }
 
     pub fn shutdown(&mut self) {
+        // Signal the epoll thread to exit, unpause it (it may be parked
+        // if the VM was paused for migration), then wait for it to finish.
+        // This ensures the thread drops its Arc<VhostUserHandle>, fully
+        // closing the vhost-user socket so the backend can accept a new
+        // connection from the destination.
+        if let Some(kill_evt) = self.virtio_common.kill_evt.take() {
+            let _ = kill_evt.write(1);
+        }
+        self.virtio_common.paused.store(false, Ordering::SeqCst);
+        if let Some(t) = self.epoll_thread.as_ref() {
+            t.thread().unpark();
+        }
+        if let Some(t) = self.epoll_thread.take() {
+            let _ = t.join();
+        }
+
         // Remove socket path if needed
         if self.server {
             let _ = std::fs::remove_file(&self.socket_path);
@@ -485,12 +504,11 @@ impl VhostUserCommon {
 
     pub fn state<C: Default>(
         &self,
-        common: &crate::VirtioCommon,
         config: C,
     ) -> std::result::Result<VhostUserState<C>, MigratableError> {
         let mut state = VhostUserState {
-            avail_features: common.avail_features,
-            acked_features: common.acked_features,
+            avail_features: self.virtio_common.avail_features,
+            acked_features: self.virtio_common.acked_features,
             config,
             acked_protocol_features: self.acked_protocol_features,
             vu_num_queues: self.vu_num_queues,
@@ -586,15 +604,12 @@ impl VhostUserCommon {
         Ok(())
     }
 
-    pub fn complete_migration(
-        &mut self,
-        kill_evt: Option<EventFd>,
-    ) -> std::result::Result<(), MigratableError> {
+    pub fn complete_migration(&mut self) -> std::result::Result<(), MigratableError> {
         self.migration_started = false;
 
         // Make sure the device thread is killed in order to prevent from
         // reconnections to the socket.
-        if let Some(kill_evt) = kill_evt {
+        if let Some(kill_evt) = self.virtio_common.kill_evt.take() {
             kill_evt.write(1).map_err(|e| {
                 MigratableError::CompleteMigration(anyhow!(
                     "Error killing vhost-user thread: {e:?}"

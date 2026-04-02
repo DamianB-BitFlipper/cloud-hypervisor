@@ -5,9 +5,10 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::any::Any;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::{io, result};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::Resource;
@@ -35,7 +36,7 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct BarReprogrammingParams {
     pub old_base: u64,
     pub new_base: u64,
@@ -48,7 +49,7 @@ pub trait PciDevice: Send {
     /// returns an address. Returns a Vec of (GuestAddress, GuestUsize) tuples.
     fn allocate_bars(
         &mut self,
-        _allocator: &Arc<Mutex<SystemAllocator>>,
+        _allocator: &mut SystemAllocator,
         _mmio32_allocator: &mut AddressAllocator,
         _mmio64_allocator: &mut AddressAllocator,
         _resources: Option<Vec<Resource>>,

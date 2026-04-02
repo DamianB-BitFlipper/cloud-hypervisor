@@ -11,13 +11,14 @@ use libc::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 use log::warn;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::async_io::{
-    AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFile, DiskFileError, DiskFileResult,
-};
+use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
+use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::{
-    BatchRequest, DiskTopology, RequestType, SECTOR_SIZE, probe_sparse_support, query_device_size,
+    BatchRequest, DiskTopology, RequestType, SECTOR_SIZE, disk_file, probe_sparse_support,
+    query_device_size,
 };
 
+#[derive(Debug)]
 pub struct RawFileDisk {
     file: File,
 }
@@ -28,46 +29,68 @@ impl RawFileDisk {
     }
 }
 
-impl DiskFile for RawFileDisk {
-    fn logical_size(&mut self) -> DiskFileResult<u64> {
-        Ok(query_device_size(&self.file)
-            .map_err(DiskFileError::Size)?
-            .0)
+impl disk_file::DiskSize for RawFileDisk {
+    fn logical_size(&self) -> BlockResult<u64> {
+        query_device_size(&self.file)
+            .map(|(logical_size, _)| logical_size)
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::Size(e)))
     }
+}
 
-    fn physical_size(&mut self) -> DiskFileResult<u64> {
-        Ok(query_device_size(&self.file)
-            .map_err(DiskFileError::Size)?
-            .1)
+impl disk_file::PhysicalSize for RawFileDisk {
+    fn physical_size(&self) -> BlockResult<u64> {
+        query_device_size(&self.file)
+            .map(|(_, physical_size)| physical_size)
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::Size(e)))
     }
+}
 
-    fn new_async_io(&self, ring_depth: u32) -> DiskFileResult<Box<dyn AsyncIo>> {
-        let mut raw = RawFileAsync::new(self.file.as_raw_fd(), ring_depth)
-            .map_err(DiskFileError::NewAsyncIo)?;
-        raw.alignment =
-            DiskTopology::probe(&self.file).map_or(SECTOR_SIZE, |t| t.logical_block_size);
-        Ok(Box::new(raw) as Box<dyn AsyncIo>)
+impl disk_file::DiskFd for RawFileDisk {
+    fn fd(&self) -> BorrowedDiskFd<'_> {
+        BorrowedDiskFd::new(self.file.as_raw_fd())
     }
+}
 
-    fn topology(&mut self) -> DiskTopology {
-        if let Ok(topology) = DiskTopology::probe(&self.file) {
-            topology
-        } else {
+impl disk_file::Geometry for RawFileDisk {
+    fn topology(&self) -> DiskTopology {
+        DiskTopology::probe(&self.file).unwrap_or_else(|_| {
             warn!("Unable to get device topology. Using default topology");
             DiskTopology::default()
-        }
+        })
     }
+}
 
-    fn resize(&mut self, size: u64) -> DiskFileResult<()> {
-        self.file.set_len(size).map_err(DiskFileError::ResizeError)
-    }
-
+impl disk_file::SparseCapable for RawFileDisk {
     fn supports_sparse_operations(&self) -> bool {
         probe_sparse_support(&self.file)
     }
+}
 
-    fn fd(&mut self) -> BorrowedDiskFd<'_> {
-        BorrowedDiskFd::new(self.file.as_raw_fd())
+impl disk_file::Resizable for RawFileDisk {
+    fn resize(&mut self, size: u64) -> BlockResult<()> {
+        self.file
+            .set_len(size)
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::ResizeError(e)))
+    }
+}
+
+impl disk_file::DiskFile for RawFileDisk {}
+
+impl disk_file::AsyncDiskFile for RawFileDisk {
+    fn try_clone(&self) -> BlockResult<Box<dyn disk_file::AsyncDiskFile>> {
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::Clone(e)))?;
+        Ok(Box::new(RawFileDisk { file }))
+    }
+
+    fn new_async_io(&self, ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>> {
+        let mut raw = RawFileAsync::new(self.file.as_raw_fd(), ring_depth)
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::NewAsyncIo(e)))?;
+        raw.alignment =
+            DiskTopology::probe(&self.file).map_or(SECTOR_SIZE, |t| t.logical_block_size);
+        Ok(Box::new(raw) as Box<dyn AsyncIo>)
     }
 }
 

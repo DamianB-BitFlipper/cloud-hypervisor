@@ -340,7 +340,7 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
                     Ok(_) => VIRTIO_BLK_S_OK,
                     Err(e) => {
                         warn!("Request failed: {request:x?} {e:?}");
-                        VIRTIO_BLK_S_IOERR
+                        e.status() as u32
                     }
                 };
 
@@ -778,13 +778,14 @@ impl Block {
                     | (1u64 << VIRTIO_RING_F_INDIRECT_DESC);
 
                 // When backend supports sparse operations:
-                // - Always advertise WRITE_ZEROES
-                // - Advertise DISCARD only if sparse=true OR format supports marking
-                //   clusters as zero without deallocating
+                // - Always advertise WRITE_ZEROES (safe for all drivers)
+                // - Advertise DISCARD only when sparse=true, since DISCARD
+                //   deallocates space via punch_hole and should require
+                //   explicit user opt in.
                 let mut discard_supported = false;
                 if disk_image.supports_sparse_operations() {
                     avail_features |= 1u64 << VIRTIO_BLK_F_WRITE_ZEROES;
-                    if sparse || disk_image.supports_zero_flag() {
+                    if sparse {
                         avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
                         discard_supported = true;
                     }
@@ -973,24 +974,24 @@ impl Block {
         }
     }
 
-    fn update_writeback(&mut self) {
-        // Use writeback from config if VIRTIO_BLK_F_CONFIG_WCE
-        let writeback = if self.common.feature_acked(VIRTIO_BLK_F_CONFIG_WCE.into()) {
-            self.config.writeback == 1
-        } else {
-            // Else check if VIRTIO_BLK_F_FLUSH negotiated
-            self.common.feature_acked(VIRTIO_BLK_F_FLUSH.into())
-        };
+    /// The virtio v1.2 spec says "If VIRTIO_BLK_F_CONFIG_WCE was not
+    /// negotiated but VIRTIO_BLK_F_FLUSH was, the driver SHOULD assume
+    /// presence of a writeback cache." It also says "If
+    /// VIRTIO_BLK_F_CONFIG_WCE is negotiated but VIRTIO_BLK_F_FLUSH is not,
+    /// the device MUST initialize writeback to 0."
+    fn is_writeback_enabled(&self, desired: bool) -> bool {
+        let flush = self.common.feature_acked(VIRTIO_BLK_F_FLUSH.into());
+        let wce = self.common.feature_acked(VIRTIO_BLK_F_CONFIG_WCE.into());
+        if wce { flush && desired } else { flush }
+    }
 
+    fn set_writeback_mode(&mut self, enabled: bool) {
+        self.config.writeback = enabled as u8;
+        self.writeback.store(enabled, Ordering::Release);
         info!(
             "Changing cache mode to {}",
-            if writeback {
-                "writeback"
-            } else {
-                "writethrough"
-            }
+            if enabled { "writeback" } else { "writethrough" }
         );
-        self.writeback.store(writeback, Ordering::Release);
     }
 
     pub fn resize(&mut self, new_size: u64) -> Result<()> {
@@ -1072,8 +1073,8 @@ impl VirtioDevice for Block {
             return;
         }
 
-        self.config.writeback = data[0];
-        self.update_writeback();
+        let writeback = self.is_writeback_enabled(data[0] == 1);
+        self.set_writeback_mode(writeback);
     }
 
     fn activate(&mut self, context: crate::device::ActivationContext) -> ActivateResult {
@@ -1096,7 +1097,8 @@ impl VirtioDevice for Block {
         // Recompute the barrier size from the queues that are actually activated.
         self.common.paused_sync = Some(Arc::new(Barrier::new(queues.len() + 1)));
 
-        self.update_writeback();
+        let writeback = self.is_writeback_enabled(self.config.writeback == 1);
+        self.set_writeback_mode(writeback);
 
         let mut epoll_threads = Vec::new();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
@@ -1166,6 +1168,7 @@ impl VirtioDevice for Block {
 
     fn reset(&mut self) -> Option<Arc<dyn VirtioInterrupt>> {
         let result = self.common.reset();
+        self.set_writeback_mode(true);
         event!("virtio-device", "reset", "id", &self.id);
         result
     }

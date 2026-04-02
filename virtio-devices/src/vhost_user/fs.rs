@@ -1,9 +1,9 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::result;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex};
-use std::{result, thread};
 
 use event_monitor::event;
 use log::{error, info};
@@ -59,7 +59,6 @@ impl Default for VirtioFsConfig {
 unsafe impl ByteValued for VirtioFsConfig {}
 
 pub struct Fs {
-    common: VirtioCommon,
     vu_common: VhostUserCommon,
     id: String,
     config: VirtioFsConfig,
@@ -68,7 +67,6 @@ pub struct Fs {
     cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
     seccomp_action: SeccompAction,
     guest_memory: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
-    epoll_thread: Option<thread::JoinHandle<()>>,
     exit_evt: EventFd,
     iommu: bool,
 }
@@ -178,17 +176,17 @@ impl Fs {
         };
 
         Ok(Fs {
-            common: VirtioCommon {
-                device_type: VirtioDeviceType::Fs as u32,
-                avail_features,
-                acked_features,
-                queue_sizes: vec![queue_size; num_queues],
-                paused_sync: Some(Arc::new(Barrier::new(2))),
-                min_queues: 1,
-                paused: Arc::new(AtomicBool::new(paused)),
-                ..Default::default()
-            },
             vu_common: VhostUserCommon {
+                virtio_common: VirtioCommon {
+                    device_type: VirtioDeviceType::Fs as u32,
+                    avail_features,
+                    acked_features,
+                    queue_sizes: vec![queue_size; num_queues],
+                    paused_sync: Some(Arc::new(Barrier::new(2))),
+                    min_queues: 1,
+                    paused: Arc::new(AtomicBool::new(paused)),
+                    ..Default::default()
+                },
                 vu: Some(Arc::new(Mutex::new(vu))),
                 acked_protocol_features,
                 socket_path: path.to_string(),
@@ -201,43 +199,33 @@ impl Fs {
             cache,
             seccomp_action,
             guest_memory: None,
-            epoll_thread: None,
             exit_evt,
             iommu,
         })
     }
 
     fn state(&self) -> std::result::Result<State, MigratableError> {
-        self.vu_common.state(&self.common, self.config)
+        self.vu_common.state(self.config)
     }
 }
 
 impl Drop for Fs {
     fn drop(&mut self) {
-        if let Some(kill_evt) = self.common.kill_evt.take() {
-            // Ignore the result because there is nothing we can do about it.
-            let _ = kill_evt.write(1);
-        }
-        self.common.wait_for_epoll_threads();
-        if let Some(thread) = self.epoll_thread.take()
-            && let Err(e) = thread.join()
-        {
-            error!("Error joining thread: {e:?}");
-        }
+        self.vu_common.shutdown();
     }
 }
 
 impl VirtioDevice for Fs {
     fn device_type(&self) -> u32 {
-        self.common.device_type
+        self.vu_common.virtio_common.device_type
     }
 
     fn queue_max_sizes(&self) -> &[u16] {
-        &self.common.queue_sizes
+        &self.vu_common.virtio_common.queue_sizes
     }
 
     fn features(&self) -> u64 {
-        let mut features = self.common.avail_features;
+        let mut features = self.vu_common.virtio_common.avail_features;
         if self.iommu {
             features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
         }
@@ -245,7 +233,7 @@ impl VirtioDevice for Fs {
     }
 
     fn ack_features(&mut self, value: u64) {
-        self.common.ack_features(value);
+        self.vu_common.virtio_common.ack_features(value);
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -259,26 +247,28 @@ impl VirtioDevice for Fs {
             queues,
             ..
         } = context;
-        self.common.activate(&queues, interrupt_cb.clone())?;
+        self.vu_common
+            .virtio_common
+            .activate(&queues, interrupt_cb.clone())?;
         self.guest_memory = Some(mem.clone());
 
         let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
         // Run a dedicated thread for handling potential reconnections with
         // the backend.
-        let (kill_evt, pause_evt) = self.common.dup_eventfds();
+        let (kill_evt, pause_evt) = self.vu_common.virtio_common.dup_eventfds();
 
         let mut handler = self.vu_common.activate(
             mem,
             &queues,
             interrupt_cb,
-            self.common.acked_features,
+            self.vu_common.virtio_common.acked_features,
             backend_req_handler,
             kill_evt,
             pause_evt,
         )?;
 
-        let paused = self.common.paused.clone();
-        let paused_sync = self.common.paused_sync.clone();
+        let paused = self.vu_common.virtio_common.paused.clone();
+        let paused_sync = self.vu_common.virtio_common.paused_sync.clone();
 
         let mut epoll_threads = Vec::new();
         spawn_virtio_thread(
@@ -289,7 +279,7 @@ impl VirtioDevice for Fs {
             &self.exit_evt,
             move || handler.run(&paused, paused_sync.as_ref().unwrap()),
         )?;
-        self.epoll_thread = Some(epoll_threads.remove(0));
+        self.vu_common.epoll_thread = Some(epoll_threads.remove(0));
 
         event!("virtio-device", "activated", "id", &self.id);
         Ok(())
@@ -297,8 +287,8 @@ impl VirtioDevice for Fs {
 
     fn reset(&mut self) -> Option<Arc<dyn VirtioInterrupt>> {
         // We first must resume the virtio thread if it was paused.
-        if self.common.pause_evt.take().is_some() {
-            self.common.resume().ok()?;
+        if self.vu_common.virtio_common.pause_evt.take().is_some() {
+            self.vu_common.virtio_common.resume().ok()?;
         }
 
         if let Some(vu) = &self.vu_common.vu
@@ -308,7 +298,7 @@ impl VirtioDevice for Fs {
             return None;
         }
 
-        if let Some(kill_evt) = self.common.kill_evt.take() {
+        if let Some(kill_evt) = self.vu_common.virtio_common.kill_evt.take() {
             // Ignore the result because there is nothing we can do about it.
             let _ = kill_evt.write(1);
         }
@@ -316,7 +306,7 @@ impl VirtioDevice for Fs {
         event!("virtio-device", "reset", "id", &self.id);
 
         // Return the interrupt
-        Some(self.common.interrupt_cb.take().unwrap())
+        Some(self.vu_common.virtio_common.interrupt_cb.take().unwrap())
     }
 
     fn shutdown(&mut self) {
@@ -364,13 +354,13 @@ impl VirtioDevice for Fs {
 impl Pausable for Fs {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
         self.vu_common.pause()?;
-        self.common.pause()
+        self.vu_common.virtio_common.pause()
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
-        self.common.resume()?;
+        self.vu_common.virtio_common.resume()?;
 
-        if let Some(epoll_thread) = &self.epoll_thread {
+        if let Some(epoll_thread) = &self.vu_common.epoll_thread {
             epoll_thread.thread().unpark();
         }
 
@@ -407,7 +397,6 @@ impl Migratable for Fs {
     }
 
     fn complete_migration(&mut self) -> std::result::Result<(), MigratableError> {
-        self.vu_common
-            .complete_migration(self.common.kill_evt.take())
+        self.vu_common.complete_migration()
     }
 }

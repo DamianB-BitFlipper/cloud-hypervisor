@@ -32,7 +32,6 @@ use arch::layout::{APIC_START, IOAPIC_SIZE, IOAPIC_START};
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use arch::{DeviceType, MmioDeviceInfo};
 use arch::{NumaNodes, layout};
-use block::async_io::DiskFile;
 use block::disk_file::DiskBackend;
 use block::error::BlockError;
 use block::fixed_vhd_sync::FixedVhdDiskSync;
@@ -42,7 +41,7 @@ use block::raw_sync::RawFileDiskSync;
 use block::vhdx_sync::VhdxDiskSync;
 use block::{
     ImageType, block_aio_is_supported, block_io_uring_is_supported, detect_image_type,
-    open_disk_image, preallocate_disk, vhdx,
+    open_disk_image, preallocate_disk,
 };
 #[cfg(feature = "io_uring")]
 use block::{fixed_vhd_async::FixedVhdDiskAsync, raw_async::RawFileDisk};
@@ -569,11 +568,11 @@ pub enum DeviceManagerError {
 
     /// Failed to create FixedVhdDiskAsync
     #[error("Failed to create FixedVhdDiskAsync")]
-    CreateFixedVhdDiskAsync(#[source] io::Error),
+    CreateFixedVhdDiskAsync(#[source] BlockError),
 
     /// Failed to create FixedVhdDiskSync
     #[error("Failed to create FixedVhdDiskSync")]
-    CreateFixedVhdDiskSync(#[source] io::Error),
+    CreateFixedVhdDiskSync(#[source] BlockError),
 
     /// Failed to create QcowDiskSync
     #[error("Failed to create QcowDiskSync")]
@@ -581,7 +580,7 @@ pub enum DeviceManagerError {
 
     /// Failed to create FixedVhdxDiskSync
     #[error("Failed to create FixedVhdxDiskSync")]
-    CreateFixedVhdxDiskSync(#[source] vhdx::VhdxError),
+    CreateFixedVhdxDiskSync(#[source] BlockError),
 
     /// Failed to add DMA mapping handler to virtio-mem device.
     #[error("Failed to add DMA mapping handler to virtio-mem device")]
@@ -1757,7 +1756,7 @@ impl DeviceManager {
     }
 
     #[cfg(target_arch = "aarch64")]
-    pub fn get_interrupt_controller(&mut self) -> Option<&Arc<Mutex<gic::Gic>>> {
+    pub fn get_interrupt_controller(&self) -> Option<&Arc<Mutex<gic::Gic>>> {
         self.interrupt_controller.as_ref()
     }
 
@@ -1794,7 +1793,7 @@ impl DeviceManager {
     }
 
     #[cfg(target_arch = "riscv64")]
-    pub fn get_interrupt_controller(&mut self) -> Option<&Arc<Mutex<aia::Aia>>> {
+    pub fn get_interrupt_controller(&self) -> Option<&Arc<Mutex<aia::Aia>>> {
         self.interrupt_controller.as_ref()
     }
 
@@ -2722,17 +2721,17 @@ impl DeviceManager {
                         unreachable!("Checked in if statement above");
                         #[cfg(feature = "io_uring")]
                         {
-                            DiskBackend::Legacy(Box::new(
+                            DiskBackend::Next(Box::new(
                                 FixedVhdDiskAsync::new(file)
                                     .map_err(DeviceManagerError::CreateFixedVhdDiskAsync)?,
-                            ) as Box<dyn DiskFile>)
+                            ))
                         }
                     } else {
                         info!("Using synchronous fixed VHD disk file");
-                        DiskBackend::Legacy(Box::new(
+                        DiskBackend::Next(Box::new(
                             FixedVhdDiskSync::new(file)
                                 .map_err(DeviceManagerError::CreateFixedVhdDiskSync)?,
-                        ) as Box<dyn DiskFile>)
+                        ))
                     }
                 }
                 ImageType::Raw => {
@@ -2756,18 +2755,14 @@ impl DeviceManager {
                         unreachable!("Checked in if statement above");
                         #[cfg(feature = "io_uring")]
                         {
-                            DiskBackend::Legacy(
-                                Box::new(RawFileDisk::new(file)) as Box<dyn DiskFile>
-                            )
+                            DiskBackend::Next(Box::new(RawFileDisk::new(file)))
                         }
                     } else if !disk_cfg.disable_aio && self.aio_is_supported() {
                         info!("Using asynchronous RAW disk file (aio)");
-                        DiskBackend::Legacy(Box::new(RawFileDiskAio::new(file)) as Box<dyn DiskFile>)
+                        DiskBackend::Next(Box::new(RawFileDiskAio::new(file)))
                     } else {
                         info!("Using synchronous RAW disk file");
-                        DiskBackend::Legacy(
-                            Box::new(RawFileDiskSync::new(file)) as Box<dyn DiskFile>
-                        )
+                        DiskBackend::Next(Box::new(RawFileDiskSync::new(file)))
                     }
                 }
                 ImageType::Qcow2 => {
@@ -2788,10 +2783,10 @@ impl DeviceManager {
                 }
                 ImageType::Vhdx => {
                     info!("Using synchronous VHDX disk file");
-                    DiskBackend::Legacy(Box::new(
+                    DiskBackend::Next(Box::new(
                         VhdxDiskSync::new(file)
                             .map_err(DeviceManagerError::CreateFixedVhdxDiskSync)?,
-                    ) as Box<dyn DiskFile>)
+                    ))
                 }
                 ImageType::Unknown => unreachable!(),
             };
@@ -4001,7 +3996,7 @@ impl DeviceManager {
             .lock()
             .unwrap()
             .allocate_bars(
-                &self.address_manager.allocator,
+                &mut self.address_manager.allocator.lock().unwrap(),
                 &mut self.pci_segments[segment_id as usize]
                     .mem32_allocator
                     .lock()

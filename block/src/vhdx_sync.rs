@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex};
 
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::async_io::{
-    AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFile, DiskFileError, DiskFileResult,
-};
-use crate::vhdx::{Result as VhdxResult, Vhdx};
-use crate::{AsyncAdaptor, BlockBackend, Error};
+use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
+use crate::error::{BlockError, BlockErrorKind, BlockResult, ErrorOp};
+use crate::vhdx::Vhdx;
+use crate::{AsyncAdaptor, BlockBackend, Error, disk_file};
 
+#[derive(Debug)]
 pub struct VhdxDiskSync {
     // FIXME: The Mutex serializes all VHDX I/O operations across queues, which
     // is necessary for correctness but eliminates any parallelism benefit from
@@ -28,34 +28,67 @@ pub struct VhdxDiskSync {
 }
 
 impl VhdxDiskSync {
-    pub fn new(f: File) -> VhdxResult<Self> {
+    pub fn new(f: File) -> BlockResult<Self> {
         Ok(VhdxDiskSync {
-            vhdx_file: Arc::new(Mutex::new(Vhdx::new(f)?)),
+            vhdx_file: Arc::new(Mutex::new(Vhdx::new(f).map_err(|e| {
+                BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::Open)
+            })?)),
         })
     }
 }
 
-impl DiskFile for VhdxDiskSync {
-    fn logical_size(&mut self) -> DiskFileResult<u64> {
+impl disk_file::DiskSize for VhdxDiskSync {
+    fn logical_size(&self) -> BlockResult<u64> {
         Ok(self.vhdx_file.lock().unwrap().virtual_disk_size())
     }
+}
 
-    fn physical_size(&mut self) -> DiskFileResult<u64> {
-        self.vhdx_file.lock().unwrap().physical_size().map_err(|e| {
-            let io_inner = match e {
-                Error::GetFileMetadata(e) => e,
-                _ => unreachable!(),
-            };
-            DiskFileError::Size(io_inner)
-        })
+impl disk_file::PhysicalSize for VhdxDiskSync {
+    fn physical_size(&self) -> BlockResult<u64> {
+        self.vhdx_file
+            .lock()
+            .unwrap()
+            .physical_size()
+            .map_err(|e| match e {
+                Error::GetFileMetadata(io) => {
+                    BlockError::new(BlockErrorKind::Io, Error::GetFileMetadata(io))
+                }
+                _ => BlockError::new(BlockErrorKind::Io, e),
+            })
     }
+}
 
-    fn new_async_io(&self, _ring_depth: u32) -> DiskFileResult<Box<dyn AsyncIo>> {
-        Ok(Box::new(VhdxSync::new(Arc::clone(&self.vhdx_file))) as Box<dyn AsyncIo>)
-    }
-
-    fn fd(&mut self) -> BorrowedDiskFd<'_> {
+impl disk_file::DiskFd for VhdxDiskSync {
+    fn fd(&self) -> BorrowedDiskFd<'_> {
         BorrowedDiskFd::new(self.vhdx_file.lock().unwrap().as_raw_fd())
+    }
+}
+
+impl disk_file::Geometry for VhdxDiskSync {}
+
+impl disk_file::SparseCapable for VhdxDiskSync {}
+
+impl disk_file::Resizable for VhdxDiskSync {
+    fn resize(&mut self, _size: u64) -> BlockResult<()> {
+        Err(BlockError::new(
+            BlockErrorKind::UnsupportedFeature,
+            DiskFileError::ResizeError(std::io::Error::other("resize not supported for VHDX")),
+        )
+        .with_op(ErrorOp::Resize))
+    }
+}
+
+impl disk_file::DiskFile for VhdxDiskSync {}
+
+impl disk_file::AsyncDiskFile for VhdxDiskSync {
+    fn try_clone(&self) -> BlockResult<Box<dyn disk_file::AsyncDiskFile>> {
+        Ok(Box::new(VhdxDiskSync {
+            vhdx_file: Arc::clone(&self.vhdx_file),
+        }))
+    }
+
+    fn new_async_io(&self, _ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>> {
+        Ok(Box::new(VhdxSync::new(Arc::clone(&self.vhdx_file))))
     }
 }
 

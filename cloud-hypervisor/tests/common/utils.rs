@@ -9,6 +9,7 @@ use std::process::{Child, Command};
 use std::string::String;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 use std::{cmp, fs, io, thread};
 
 use test_infra::*;
@@ -93,6 +94,17 @@ pub(crate) fn temp_api_path(tmp_dir: &TempDir) -> String {
     )
 }
 
+pub(crate) fn wait_for_virtiofsd_socket(socket: &str) {
+    // Wait for virtiofds to start
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !Path::new(socket).exists() {
+        if Instant::now() > deadline {
+            panic!("virtiofsd socket did not appear within 10s");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub(crate) fn prepare_virtiofsd(
     tmp_dir: &TempDir,
     shared_dir: &str,
@@ -116,7 +128,7 @@ pub(crate) fn prepare_virtiofsd(
         .spawn()
         .unwrap();
 
-    thread::sleep(std::time::Duration::new(10, 0));
+    wait_for_virtiofsd_socket(virtiofsd_socket_path.as_str());
 
     (child, virtiofsd_socket_path)
 }
@@ -241,41 +253,6 @@ pub(crate) fn prepare_swtpm_daemon(tmp_dir: &TempDir) -> (std::process::Command,
     swtpm_command.args(swtpm_args);
 
     (swtpm_command, swtpm_socket_path)
-}
-
-pub(crate) fn remote_command(api_socket: &str, command: &str, arg: Option<&str>) -> bool {
-    let mut cmd = Command::new(clh_command("ch-remote"));
-    cmd.args([&format!("--api-socket={api_socket}"), command]);
-
-    if let Some(arg) = arg {
-        cmd.arg(arg);
-    }
-    let output = cmd.output().unwrap();
-    if output.status.success() {
-        true
-    } else {
-        eprintln!("Error running ch-remote command: {:?}", &cmd);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("stderr: {stderr}");
-        false
-    }
-}
-
-pub(crate) fn remote_command_w_output(
-    api_socket: &str,
-    command: &str,
-    arg: Option<&str>,
-) -> (bool, Vec<u8>) {
-    let mut cmd = Command::new(clh_command("ch-remote"));
-    cmd.args([&format!("--api-socket={api_socket}"), command]);
-
-    if let Some(arg) = arg {
-        cmd.arg(arg);
-    }
-
-    let output = cmd.output().expect("Failed to launch ch-remote");
-
-    (output.status.success(), output.stdout)
 }
 
 pub(crate) fn resize_command(
