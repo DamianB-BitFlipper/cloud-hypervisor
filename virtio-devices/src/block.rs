@@ -778,14 +778,15 @@ impl Block {
                     | (1u64 << VIRTIO_RING_F_INDIRECT_DESC);
 
                 // When backend supports sparse operations:
-                // - Always advertise WRITE_ZEROES (safe for all drivers)
-                // - Advertise DISCARD only when sparse=true, since DISCARD
-                //   deallocates space via punch_hole and should require
-                //   explicit user opt in.
+                // - Advertise WRITE_ZEROES only when the host backend can execute it
+                // - Advertise DISCARD only if sparse=true OR format supports marking
+                //   clusters as zero without deallocating
                 let mut discard_supported = false;
-                if disk_image.supports_sparse_operations() {
+                if disk_image.supports_write_zeroes() {
                     avail_features |= 1u64 << VIRTIO_BLK_F_WRITE_ZEROES;
-                    if sparse {
+                }
+                if disk_image.supports_sparse_operations() {
+                    if sparse || disk_image.supports_zero_flag() {
                         avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
                         discard_supported = true;
                     }
