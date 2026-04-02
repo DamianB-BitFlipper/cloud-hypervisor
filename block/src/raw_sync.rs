@@ -13,7 +13,9 @@ use vmm_sys_util::eventfd::EventFd;
 use crate::async_io::{
     AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFile, DiskFileError, DiskFileResult,
 };
-use crate::{DiskTopology, SECTOR_SIZE, probe_sparse_support, query_device_size};
+use crate::{
+    DiskTopology, SECTOR_SIZE, probe_sparse_support, probe_write_zeroes_support, query_device_size,
+};
 
 pub struct RawFileDiskSync {
     file: File,
@@ -56,6 +58,10 @@ impl DiskFile for RawFileDiskSync {
 
     fn supports_sparse_operations(&self) -> bool {
         probe_sparse_support(&self.file)
+    }
+
+    fn supports_write_zeroes(&self) -> bool {
+        probe_write_zeroes_support(&self.file)
     }
 
     fn fd(&mut self) -> BorrowedDiskFd<'_> {

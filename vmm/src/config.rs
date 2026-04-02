@@ -24,10 +24,13 @@ use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
 
+use arch::layout;
+
 use crate::landlock::LandlockAccess;
 use crate::vm_config::*;
 
-const MAX_NUM_PCI_SEGMENTS: u16 = 96;
+const MAX_NUM_PCI_SEGMENTS: u16 =
+    (layout::PCI_MMCONFIG_SIZE / layout::PCI_MMIO_CONFIG_SIZE_PER_SEGMENT) as u16;
 const MAX_IOMMU_ADDRESS_WIDTH_BITS: u8 = 64;
 
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -142,6 +145,9 @@ pub enum Error {
     /// Missing path from device,
     #[error("Error parsing --device: path missing")]
     ParseDevicePathMissing,
+    /// Invalid no-mmap BAR from device
+    #[error("Error parsing --device: invalid no-mmap BAR index {0}")]
+    ParseDeviceNoMmapBarInvalid(u8),
     /// Failed parsing vsock parameters
     #[error("Error parsing --vsock")]
     ParseVsock(#[source] OptionParserError),
@@ -300,6 +306,9 @@ pub enum ValidationError {
     /// Invalid PCI segment id
     #[error("Invalid PCI segment id: {0}")]
     InvalidPciSegment(u16),
+    /// Invalid VFIO no-mmap BAR index
+    #[error("Invalid VFIO no-mmap BAR index: {0}")]
+    InvalidDeviceNoMmapBar(u8),
     /// Invalid PCI segment aperture weight
     #[error("Invalid PCI segment aperture weight: {0}")]
     InvalidPciSegmentApertureWeight(u32),
@@ -2190,7 +2199,7 @@ impl DebugConsoleConfig {
 }
 
 impl DeviceConfig {
-    pub const SYNTAX: &'static str = "Direct device assignment parameters \"path=<device_path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>,x_nv_gpudirect_clique=<clique_id>,x_no_mmap=on|off\"";
+    pub const SYNTAX: &'static str = "Direct device assignment parameters \"path=<device_path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>,x_nv_gpudirect_clique=<clique_id>,x_no_mmap_bars=[<bar>...],root_port=on|off\"";
 
     pub fn parse(device: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2200,7 +2209,8 @@ impl DeviceConfig {
             .add("iommu")
             .add("pci_segment")
             .add("x_nv_gpudirect_clique")
-            .add("x_no_mmap");
+            .add("x_no_mmap_bars")
+            .add("root_port");
         parser.parse(device).map_err(Error::ParseDevice)?;
 
         let path = parser
@@ -2220,8 +2230,20 @@ impl DeviceConfig {
         let x_nv_gpudirect_clique = parser
             .convert::<u8>("x_nv_gpudirect_clique")
             .map_err(Error::ParseDevice)?;
-        let x_no_mmap = parser
-            .convert::<Toggle>("x_no_mmap")
+        let IntegerList(raw_x_no_mmap_bars) = parser
+            .convert::<IntegerList>("x_no_mmap_bars")
+            .map_err(Error::ParseDevice)?
+            .unwrap_or(IntegerList(Vec::new()));
+        let mut x_no_mmap_bars = Vec::with_capacity(raw_x_no_mmap_bars.len());
+        for bar in raw_x_no_mmap_bars {
+            let bar = u8::try_from(bar).map_err(|_| Error::ParseDeviceNoMmapBarInvalid(u8::MAX))?;
+            if bar > 5 {
+                return Err(Error::ParseDeviceNoMmapBarInvalid(bar));
+            }
+            x_no_mmap_bars.push(bar);
+        }
+        let root_port = parser
+            .convert::<Toggle>("root_port")
             .map_err(Error::ParseDevice)?
             .unwrap_or(Toggle(false))
             .0;
@@ -2231,7 +2253,8 @@ impl DeviceConfig {
             id,
             pci_segment,
             x_nv_gpudirect_clique,
-            x_no_mmap,
+            x_no_mmap_bars,
+            root_port,
         })
     }
 
@@ -2246,6 +2269,12 @@ impl DeviceConfig {
                 && !self.iommu
             {
                 return Err(ValidationError::OnIommuSegment(self.pci_segment));
+            }
+        }
+
+        for bar in &self.x_no_mmap_bars {
+            if *bar > 5 {
+                return Err(ValidationError::InvalidDeviceNoMmapBar(*bar));
             }
         }
 
@@ -4341,7 +4370,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             iommu: false,
             pci_segment: 0,
             x_nv_gpudirect_clique: None,
-            x_no_mmap: false,
+            x_no_mmap_bars: Vec::new(),
+            root_port: false,
         }
     }
 
@@ -4372,9 +4402,17 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,x_no_mmap=on")?,
+            DeviceConfig::parse("path=/path/to/device,x_no_mmap_bars=[2]")?,
             DeviceConfig {
-                x_no_mmap: true,
+                x_no_mmap_bars: vec![2],
+                ..device_fixture()
+            }
+        );
+
+        assert_eq!(
+            DeviceConfig::parse("path=/path/to/device,root_port=on")?,
+            DeviceConfig {
+                root_port: true,
                 ..device_fixture()
             }
         );

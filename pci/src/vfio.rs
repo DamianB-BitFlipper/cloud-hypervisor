@@ -158,6 +158,9 @@ impl VfioMsix {
         // Update "Message Control" word
         if offset == 2 && data.len() == 2 {
             self.bar.set_msg_ctl(LittleEndian::read_u16(data));
+        } else if offset == 0 && data.len() == 4 {
+            self.bar
+                .set_msg_ctl((LittleEndian::read_u32(data) >> 16) as u16);
         }
 
         let new_enabled = self.bar.enabled();
@@ -493,7 +496,7 @@ pub(crate) struct VfioCommon {
     pub(crate) vfio_wrapper: Arc<dyn Vfio>,
     pub(crate) patches: HashMap<usize, ConfigPatch>,
     x_nv_gpudirect_clique: Option<u8>,
-    x_no_mmap: bool,
+    x_no_mmap_bars: Vec<u8>,
 }
 
 impl VfioCommon {
@@ -505,7 +508,7 @@ impl VfioCommon {
         bdf: PciBdf,
         snapshot: Option<&Snapshot>,
         x_nv_gpudirect_clique: Option<u8>,
-        x_no_mmap: bool,
+        x_no_mmap_bars: Vec<u8>,
     ) -> Result<Self, VfioPciError> {
         let pci_configuration_state = vm_migration::state_from_id(snapshot, PCI_CONFIGURATION_ID)
             .map_err(|e| {
@@ -541,7 +544,7 @@ impl VfioCommon {
             vfio_wrapper,
             patches: HashMap::new(),
             x_nv_gpudirect_clique,
-            x_no_mmap,
+            x_no_mmap_bars,
         };
 
         let state: Option<VfioCommonState> = snapshot
@@ -755,7 +758,7 @@ impl VfioCommon {
                         .allocate(restored_bar_addr, region_size, Some(region_size))
                         .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
                 }
-                PciBarRegionType::Memory64BitRegion => {
+                PciBarRegionType::Memory64BitRegion if bool::from(prefetchable) => {
                     // We need do some fixup to keep MMIO RW region and msix cap region page size
                     // aligned.
                     region_size = self.fixup_msix_region(bar_id, region_size);
@@ -769,6 +772,15 @@ impl VfioCommon {
                                 region_size,
                             )),
                         )
+                        .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
+                }
+                PciBarRegionType::Memory64BitRegion => {
+                    // Some devices expose 64-bit BARs that are still non-prefetchable.
+                    // Those must live behind the bridge's normal 32-bit memory window,
+                    // so keep them in the 32-bit PCI MMIO aperture.
+                    region_size = self.fixup_msix_region(bar_id, region_size);
+                    mmio32_allocator
+                        .allocate(restored_bar_addr, region_size, Some(region_size))
                         .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
                 }
             };
@@ -1492,7 +1504,7 @@ impl VfioPciDevice {
         memory_slot_allocator: MemorySlotAllocator,
         snapshot: Option<&Snapshot>,
         x_nv_gpudirect_clique: Option<u8>,
-        x_no_mmap: bool,
+        x_no_mmap_bars: Vec<u8>,
         device_path: PathBuf,
     ) -> Result<Self, VfioPciError> {
         let device = Arc::new(device);
@@ -1508,7 +1520,7 @@ impl VfioPciDevice {
             bdf,
             vm_migration::snapshot_from_id(snapshot, VFIO_COMMON_ID),
             x_nv_gpudirect_clique,
-            x_no_mmap,
+            x_no_mmap_bars,
         )?;
 
         let vfio_pci_device = VfioPciDevice {
@@ -1639,20 +1651,21 @@ impl VfioPciDevice {
     ///   as user memory regions.
     /// * `mem_slot` - The closure to return a memory slot.
     pub fn map_mmio_regions(&mut self) -> Result<(), VfioPciError> {
-        if self.common.x_no_mmap {
-            info!(
-                "Skipping VFIO BAR mmap for device {} at {} ({} MMIO regions)",
-                self.bdf,
-                self.device_path.display(),
-                self.common.mmio_regions.len()
-            );
-            return Ok(());
-        }
-
         let fd = self.device.as_raw_fd();
         // SAFETY: fd is guaranteed valid
         let fd = unsafe { BorrowedFd::borrow_raw(fd) };
         for region in self.common.mmio_regions.iter_mut() {
+            if self.common.x_no_mmap_bars.contains(&(region.index as u8)) {
+                info!(
+                    "Skipping VFIO BAR mmap for device {} at {} BAR {} (size = 0x{:x})",
+                    self.bdf,
+                    self.device_path.display(),
+                    region.index,
+                    region.length
+                );
+                continue;
+            }
+
             let region_flags = self.device.get_region_flags(region.index);
             if region_flags & VFIO_REGION_INFO_FLAG_MMAP != 0 {
                 let mut prot = 0;

@@ -69,7 +69,7 @@ For example, to build the Cloud Hypervisor release binary:
 ```shell
 $ pushd $CLOUDH
 $ cd cloud-hypervisor
-$ ./scripts/dev_cli.sh build --release
+$ ./scripts/dev_cli.sh build --release --arch x86_64
 ```
 
 With `dev_cli.sh`, one can also run the Cloud Hypervisor CI locally. This can be
