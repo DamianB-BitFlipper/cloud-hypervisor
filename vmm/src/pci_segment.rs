@@ -49,6 +49,7 @@ pub(crate) struct PciSegment {
 
     pub(crate) mem32_allocator: Arc<Mutex<AddressAllocator>>,
     pub(crate) mem64_allocator: Arc<Mutex<AddressAllocator>>,
+    pub(crate) next_secondary_bus: u8,
 }
 
 impl PciSegment {
@@ -102,6 +103,7 @@ impl PciSegment {
             start_of_mem64_area,
             end_of_mem64_area,
             pci_irq_slots: *pci_irq_slots,
+            next_secondary_bus: 1,
         };
 
         info!(
@@ -175,6 +177,16 @@ impl PciSegment {
                 .map_err(DeviceManagerError::NextPciDeviceId)? as u8,
             0,
         ))
+    }
+
+    pub(crate) fn allocate_secondary_bus(&mut self) -> DeviceManagerResult<u8> {
+        if u64::from(self.next_secondary_bus) >= layout::PCI_BUSES_PER_SEGMENT {
+            return Err(DeviceManagerError::NoPciBus);
+        }
+
+        let bus = self.next_secondary_bus;
+        self.next_secondary_bus += 1;
+        Ok(bus)
     }
 
     pub fn reserve_legacy_interrupts_for_pci_devices(
@@ -380,7 +392,10 @@ impl Aml for PciSegment {
             aml::Name::new(
                 "_CRS".into(),
                 &aml::ResourceTemplate::new(vec![
-                    &aml::AddressSpace::new_bus_number(0x0u16, 0x0u16),
+                    &aml::AddressSpace::new_bus_number(
+                        0x0u16,
+                        (layout::PCI_BUSES_PER_SEGMENT - 1) as u16,
+                    ),
                     #[cfg(target_arch = "x86_64")]
                     &aml::IO::new(0xcf8, 0xcf8, 1, 0x8),
                     &aml::Memory32Fixed::new(
@@ -412,7 +427,10 @@ impl Aml for PciSegment {
             aml::Name::new(
                 "_CRS".into(),
                 &aml::ResourceTemplate::new(vec![
-                    &aml::AddressSpace::new_bus_number(0x0u16, 0x0u16),
+                    &aml::AddressSpace::new_bus_number(
+                        0x0u16,
+                        (layout::PCI_BUSES_PER_SEGMENT - 1) as u16,
+                    ),
                     &aml::Memory32Fixed::new(
                         true,
                         self.mmio_config_address as u32,

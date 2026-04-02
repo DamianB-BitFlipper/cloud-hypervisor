@@ -114,6 +114,7 @@ pub struct PciBus {
     /// Devices attached to this bus.
     /// Device 0 is host bridge.
     devices: HashMap<u32, Arc<Mutex<dyn PciDevice>>>,
+    secondary_buses: HashMap<u8, Arc<Mutex<PciBus>>>,
     device_reloc: Arc<dyn DeviceRelocation>,
     device_ids: Vec<bool>,
 }
@@ -128,8 +129,18 @@ impl PciBus {
 
         PciBus {
             devices,
+            secondary_buses: HashMap::new(),
             device_reloc,
             device_ids,
+        }
+    }
+
+    pub fn new_empty(device_reloc: Arc<dyn DeviceRelocation>) -> Self {
+        PciBus {
+            devices: HashMap::new(),
+            secondary_buses: HashMap::new(),
+            device_reloc,
+            device_ids: vec![false; NUM_DEVICE_IDS],
         }
     }
 
@@ -161,6 +172,14 @@ impl PciBus {
     pub fn add_device(&mut self, device_id: u32, device: Arc<Mutex<dyn PciDevice>>) -> Result<()> {
         self.devices.insert(device_id, device);
         Ok(())
+    }
+
+    pub fn add_secondary_bus(&mut self, bus_num: u8, bus: Arc<Mutex<PciBus>>) {
+        self.secondary_buses.insert(bus_num, bus);
+    }
+
+    pub fn remove_secondary_bus(&mut self, bus_num: u8) {
+        self.secondary_buses.remove(&bus_num);
     }
 
     pub fn remove_by_device(&mut self, device: &Arc<Mutex<dyn PciDevice>>) -> Result<()> {
@@ -200,6 +219,95 @@ impl PciBus {
             Err(PciRootError::InvalidPciDeviceSlot(id))
         }
     }
+
+    fn read_config_register_for_device(&self, device: usize, register: usize) -> u32 {
+        self.devices.get(&(device as u32)).map_or(0xffff_ffff, |d| {
+            d.lock().unwrap().read_config_register(register)
+        })
+    }
+
+    fn write_config_register_for_device(
+        &self,
+        device: usize,
+        register: usize,
+        offset: u64,
+        data: &[u8],
+    ) -> Option<Arc<Barrier>> {
+        let Some(d) = self.devices.get(&(device as u32)) else {
+            return None;
+        };
+
+        let mut device = d.lock().unwrap();
+
+        let (bar_reprogram, ret) = device.write_config_register(register, offset, data);
+
+        for params in &bar_reprogram {
+            if let Err(e) = self.device_reloc.move_bar(
+                params.old_base,
+                params.new_base,
+                params.len,
+                device.deref_mut(),
+                params.region_type,
+            ) {
+                error!(
+                    "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x})",
+                    e, params.old_base, params.new_base, params.len
+                );
+            }
+        }
+
+        ret
+    }
+
+    pub fn config_space_read(
+        &self,
+        bus: usize,
+        device: usize,
+        function: usize,
+        register: usize,
+    ) -> u32 {
+        if function > 0 {
+            return 0xffff_ffff;
+        }
+
+        if bus == 0 {
+            return self.read_config_register_for_device(device, register);
+        }
+
+        self.secondary_buses
+            .get(&(bus as u8))
+            .map_or(0xffff_ffff, |pci_bus| {
+                pci_bus
+                    .lock()
+                    .unwrap()
+                    .read_config_register_for_device(device, register)
+            })
+    }
+
+    pub fn config_space_write(
+        &self,
+        bus: usize,
+        device: usize,
+        function: usize,
+        register: usize,
+        offset: u64,
+        data: &[u8],
+    ) -> Option<Arc<Barrier>> {
+        if function > 0 {
+            return None;
+        }
+
+        if bus == 0 {
+            return self.write_config_register_for_device(device, register, offset, data);
+        }
+
+        self.secondary_buses.get(&(bus as u8)).and_then(|pci_bus| {
+            pci_bus
+                .lock()
+                .unwrap()
+                .write_config_register_for_device(device, register, offset, data)
+        })
+    }
 }
 
 pub struct PciConfigIo {
@@ -225,25 +333,11 @@ impl PciConfigIo {
         let (bus, device, function, register) =
             parse_io_config_address(self.config_address & !0x8000_0000);
 
-        // Only support one bus.
-        if bus != 0 {
-            return 0xffff_ffff;
-        }
-
-        // Don't support multi-function devices.
-        if function > 0 {
-            return 0xffff_ffff;
-        }
-
         self.pci_bus
             .as_ref()
             .lock()
             .unwrap()
-            .devices
-            .get(&(device as u32))
-            .map_or(0xffff_ffff, |d| {
-                d.lock().unwrap().read_config_register(register)
-            })
+            .config_space_read(bus, device, function, register)
     }
 
     pub fn config_space_write(&mut self, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
@@ -256,41 +350,14 @@ impl PciConfigIo {
             return None;
         }
 
-        let (bus, device, _function, register) =
+        let (bus, device, function, register) =
             parse_io_config_address(self.config_address & !0x8000_0000);
 
-        // Only support one bus.
-        if bus != 0 {
-            return None;
-        }
-
-        let pci_bus = self.pci_bus.as_ref().lock().unwrap();
-        if let Some(d) = pci_bus.devices.get(&(device as u32)) {
-            let mut device = d.lock().unwrap();
-
-            // Update the register value
-            let (bar_reprogram, ret) = device.write_config_register(register, offset, data);
-
-            // Move the device's BAR if needed
-            for params in &bar_reprogram {
-                if let Err(e) = pci_bus.device_reloc.move_bar(
-                    params.old_base,
-                    params.new_base,
-                    params.len,
-                    device.deref_mut(),
-                    params.region_type,
-                ) {
-                    error!(
-                        "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x})",
-                        e, params.old_base, params.new_base, params.len
-                    );
-                }
-            }
-
-            ret
-        } else {
-            None
-        }
+        self.pci_bus
+            .as_ref()
+            .lock()
+            .unwrap()
+            .config_space_write(bus, device, function, register, offset, data)
     }
 
     fn set_config_address(&mut self, offset: u64, data: &[u8]) {
@@ -360,21 +427,12 @@ impl PciConfigMmio {
     }
 
     fn config_space_read(&self, config_address: u32) -> u32 {
-        let (bus, device, _function, register) = parse_mmio_config_address(config_address);
-
-        // Only support one bus.
-        if bus != 0 {
-            return 0xffff_ffff;
-        }
+        let (bus, device, function, register) = parse_mmio_config_address(config_address);
 
         self.pci_bus
             .lock()
             .unwrap()
-            .devices
-            .get(&(device as u32))
-            .map_or(0xffff_ffff, |d| {
-                d.lock().unwrap().read_config_register(register)
-            })
+            .config_space_read(bus, device, function, register)
     }
 
     fn config_space_write(&mut self, config_address: u32, offset: u64, data: &[u8]) {
@@ -382,36 +440,13 @@ impl PciConfigMmio {
             return;
         }
 
-        let (bus, device, _function, register) = parse_mmio_config_address(config_address);
+        let (bus, device, function, register) = parse_mmio_config_address(config_address);
 
-        // Only support one bus.
-        if bus != 0 {
-            return;
-        }
-
-        let pci_bus = self.pci_bus.lock().unwrap();
-        if let Some(d) = pci_bus.devices.get(&(device as u32)) {
-            let mut device = d.lock().unwrap();
-
-            // Update the register value
-            let (bar_reprogram, _) = device.write_config_register(register, offset, data);
-
-            // Move the device's BAR if needed
-            for params in &bar_reprogram {
-                if let Err(e) = pci_bus.device_reloc.move_bar(
-                    params.old_base,
-                    params.new_base,
-                    params.len,
-                    device.deref_mut(),
-                    params.region_type,
-                ) {
-                    error!(
-                        "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x})",
-                        e, params.old_base, params.new_base, params.len
-                    );
-                }
-            }
-        }
+        let _ = self
+            .pci_bus
+            .lock()
+            .unwrap()
+            .config_space_write(bus, device, function, register, offset, data);
     }
 }
 

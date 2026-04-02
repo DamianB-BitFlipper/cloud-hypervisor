@@ -2452,6 +2452,7 @@ name = "vm-device"
 version = "0.1.0"
 dependencies = [
  "hypervisor",
+ "log",
  "serde",
  "thiserror",
  "vfio-ioctls",

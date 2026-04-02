@@ -1200,6 +1200,9 @@ components:
           items:
             type: integer
             format: int8
+        root_port:
+          type: boolean
+          default: false
     TpmConfig:
       required:
         - socket
