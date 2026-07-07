@@ -124,6 +124,10 @@ pub enum Error {
     #[error("Error running vCPU")]
     VcpuRun(#[source] anyhow::Error),
 
+    #[cfg(target_arch = "x86_64")]
+    #[error("Error re-basing vCPU TSC at resume")]
+    VcpuSetTsc(#[source] hypervisor::HypervisorCpuError),
+
     #[error("Error spawning vCPU thread")]
     VcpuSpawn(#[source] io::Error),
 
@@ -1082,6 +1086,42 @@ impl CpuManager {
         }
 
         Ok(true)
+    }
+
+    /// Re-apply each vCPU's saved TSC (MSR_IA32_TSC) from its restored
+    /// state. Called at resume immediately before the kvm-clock is set so
+    /// the guest TSC and kvm-clock are established within microseconds of
+    /// each other.
+    ///
+    /// Without this the TSC is written once at VM-construction time (as
+    /// part of the full vCPU state) while the kvm-clock is set later, at
+    /// resume; the wall-clock gap between those two points — which grows
+    /// under host CPU contention — leaves the guest's two clocksources
+    /// skewed by that gap the instant it starts running. The guest's
+    /// clocksource watchdog then measures the divergence, marks the TSC
+    /// unstable, and switches clocksource, which stalls timer- and
+    /// spawn-heavy work (a restored guest that passes health checks but
+    /// hangs starting processes). vCPUs are paused here, so writing the
+    /// MSR safely re-bases the offset; writing each vCPU's identical saved
+    /// value in one tight pass also lets KVM keep them TSC-synchronized.
+    #[cfg(target_arch = "x86_64")]
+    pub fn reset_vcpus_tsc(&self) -> Result<()> {
+        for vcpu in self.vcpus.iter() {
+            let vcpu = vcpu.lock().unwrap();
+            let Some(tsc) = vcpu.saved_state.as_ref().and_then(|state| state.tsc()) else {
+                // No saved state (e.g. a live pause that never snapshotted)
+                // or no TSC MSR captured: nothing to re-base.
+                continue;
+            };
+            vcpu.vcpu
+                .set_msrs(&[hypervisor::arch::x86::MsrEntry {
+                    index: hypervisor::arch::x86::msr_index::MSR_IA32_TSC,
+                    data: tsc,
+                }])
+                .map_err(Error::VcpuSetTsc)?;
+        }
+
+        Ok(())
     }
 
     pub fn vcpus(&self) -> Vec<Arc<Mutex<Vcpu>>> {

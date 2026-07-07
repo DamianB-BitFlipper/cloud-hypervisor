@@ -14,7 +14,7 @@ use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use log::info;
+use log::{error, info};
 use thiserror::Error;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -77,6 +77,20 @@ pub trait EpollHelperHandler {
         _helper: &mut EpollHelper,
         _events: &[epoll::Event],
     ) -> Result<(), EpollHelperError> {
+        Ok(())
+    }
+
+    // Invoked when a PAUSE event is received, before the pause is
+    // acknowledged through the paused_sync barrier. This gives the
+    // implementation a chance to quiesce in-flight work — e.g. drain
+    // outstanding asynchronous I/O — so the device reaches a self-
+    // consistent state before the VMM's pause() returns. Devices are
+    // snapshotted while paused: anything still in flight after the barrier
+    // releases (kernel DMA into guest memory, deferred used-ring updates)
+    // is torn across the serialized device state and the memory image, and
+    // restored clones see a corrupt virtqueue. By default there is nothing
+    // to quiesce.
+    fn quiesce(&mut self, _helper: &mut EpollHelper) -> Result<(), EpollHelperError> {
         Ok(())
     }
 }
@@ -221,6 +235,16 @@ impl EpollHelper {
                     EPOLL_HELPER_EVENT_PAUSE => {
                         info!("PAUSE_EVENT received, pausing epoll loop");
 
+                        // Quiesce in-flight work before acknowledging the
+                        // pause. A quiesce failure is logged rather than
+                        // propagated: the barrier below must always be
+                        // reached or the VMM's pause() call deadlocks, and
+                        // parking with residual in-flight work matches the
+                        // previous behavior.
+                        if let Err(e) = handler.quiesce(self) {
+                            error!("Failed to quiesce handler before pause: {e:?}");
+                        }
+
                         // Acknowledge the pause is effective by using the
                         // paused_sync barrier.
                         paused_sync.wait();
@@ -292,6 +316,16 @@ impl EpollHelper {
                     }
                     EPOLL_HELPER_EVENT_PAUSE => {
                         info!("PAUSE_EVENT received, pausing epoll loop");
+
+                        // Quiesce in-flight work before acknowledging the
+                        // pause. A quiesce failure is logged rather than
+                        // propagated: the barrier below must always be
+                        // reached or the VMM's pause() call deadlocks, and
+                        // parking with residual in-flight work matches the
+                        // previous behavior.
+                        if let Err(e) = handler.quiesce(self) {
+                            error!("Failed to quiesce handler before pause: {e:?}");
+                        }
 
                         // Acknowledge the pause is effective by using the
                         // paused_sync barrier.

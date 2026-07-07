@@ -51,7 +51,7 @@ where
                 }
                 Ok(r) => {
                     if let Err(e) = r {
-                        error!("Error running worker: {e:?}");
+                        error!("{thread_name} worker thread exiting on error: {e:?}");
                         thread_exit_evt.write(1).ok();
                     }
                 }

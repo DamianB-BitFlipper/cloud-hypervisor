@@ -16,6 +16,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 use std::{io, result};
 
 use anyhow::anyhow;
@@ -160,6 +161,12 @@ struct BlockEpollHandler {
     counters: BlockCounters,
     queue_evt: EventFd,
     inflight_requests: VecDeque<(u16, Request)>,
+    // Queue-liveness watchdog state (see handle_timeout /
+    // check_stuck_inflight): when the stuck scan last ran, and the last
+    // reported stuck-age bucket so an ongoing wedge logs once per
+    // escalation instead of once per wake-up.
+    last_stuck_inflight_check: Instant,
+    stuck_inflight_bucket: u64,
     rate_limiter: Option<RateLimiterGroupHandle>,
     access_platform: Option<Arc<dyn AccessPlatform>>,
     host_cpus: Option<Vec<usize>>,
@@ -612,6 +619,44 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
         }
     }
 
+    // Scan in-flight requests for one the backend has held beyond the
+    // stuck threshold. Purely diagnostic — it changes no state besides the
+    // logging bucket — but it is the evidence that separates "the disk
+    // backend swallowed a request" from "the guest stopped submitting"
+    // when a sandbox goes quiet. Logs once per threshold-sized age bucket
+    // so an ongoing wedge escalates instead of spamming.
+    fn check_stuck_inflight(&mut self) {
+        self.last_stuck_inflight_check = Instant::now();
+
+        let Some(oldest_age) = self
+            .inflight_requests
+            .iter()
+            .map(|(_, request)| request.start.elapsed())
+            .max()
+        else {
+            self.stuck_inflight_bucket = 0;
+            return;
+        };
+
+        if oldest_age < STUCK_INFLIGHT_WARN_THRESHOLD {
+            self.stuck_inflight_bucket = 0;
+            return;
+        }
+
+        let bucket = oldest_age.as_secs() / STUCK_INFLIGHT_WARN_THRESHOLD.as_secs();
+        if bucket <= self.stuck_inflight_bucket {
+            return;
+        }
+        self.stuck_inflight_bucket = bucket;
+
+        warn!(
+            "Block queue {} has {} in-flight request(s); oldest stuck in the backend for {}ms",
+            self.queue_index,
+            self.inflight_requests.len(),
+            oldest_age.as_millis(),
+        );
+    }
+
     fn run(
         &mut self,
         paused: &AtomicBool,
@@ -624,13 +669,182 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
             helper.add_event(rate_limiter.as_raw_fd(), RATE_LIMITER_EVENT)?;
         }
         self.set_queue_thread_affinity();
-        helper.run(paused, paused_sync, self)?;
+        // A finite epoll timeout arms the queue-liveness watchdog
+        // (handle_timeout): a queue that goes silent gets inspected for
+        // unprocessed avail entries and stuck in-flight requests instead
+        // of wedging invisibly.
+        helper.run_with_timeout(paused, paused_sync, self, QUEUE_WATCHDOG_INTERVAL_MS, false)?;
 
         Ok(())
     }
 }
 
+// Bounds how long a pause may wait for in-flight requests to complete.
+// Submitted I/O always terminates (the kernel completes it with an error at
+// worst, and NBD-class backends enforce their own I/O timeouts), so this is
+// only a backstop that keeps a wedged backend from deadlocking the VMM's
+// pause() call.
+const PAUSE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(20);
+
+// Poll slice while draining: short enough to re-harvest promptly if a
+// completion slipped in between harvesting and polling, long enough to not
+// busy-spin against a slow disk.
+const PAUSE_QUIESCE_POLL_SLICE_MS: i32 = 100;
+
+// How long the block queue thread may sit with no epoll events before the
+// liveness watchdog runs (epoll_wait timeout). A healthy busy queue never
+// hits it; a wedged one gets inspected every interval.
+const QUEUE_WATCHDOG_INTERVAL_MS: i32 = 5_000;
+
+// An in-flight request older than this is reported as stuck: the backend
+// (file, NBD device, network disk) accepted it and never completed it.
+// Ordinary I/O completes in milliseconds; multi-second latencies are
+// already pathological, and this evidence is what distinguishes "backend
+// wedged" from "guest stopped asking" when a sandbox goes quiet.
+const STUCK_INFLIGHT_WARN_THRESHOLD: Duration = Duration::from_secs(10);
+
+// Rate limit for the stuck-in-flight scan on the busy path (completions
+// still flowing for other requests keep the epoll loop from ever timing
+// out, so the scan also piggybacks on completion events, at most once per
+// interval).
+const STUCK_INFLIGHT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
 impl EpollHelperHandler for BlockEpollHandler {
+    // Queue-liveness watchdog, reached only when the epoll loop saw no
+    // events for QUEUE_WATCHDOG_INTERVAL_MS. A healthy idle queue exits
+    // cheaply; a wedged one gets three checks:
+    //
+    //  1. Missed completions: harvest the async backend directly. If a
+    //     completion notification was lost, this both recovers the
+    //     requests and (via check_stuck_inflight resetting) documents it.
+    //  2. Stuck in-flight requests: evidence the backend swallowed I/O.
+    //  3. Missed avail notifications: descriptors the guest published
+    //     that were never processed — with EVENT_IDX a single lost kick
+    //     otherwise suppresses all future kicks and wedges the disk
+    //     forever. Recover by processing them now, loudly.
+    fn handle_timeout(&mut self, _helper: &mut EpollHelper) -> result::Result<(), EpollHelperError> {
+        if self.needs_reset() {
+            return Ok(());
+        }
+
+        self.process_queue_complete().map_err(|e| {
+            EpollHelperError::HandleEvent(anyhow!(
+                "Failed to process queue (complete) from watchdog: {e:?}"
+            ))
+        })?;
+        self.try_signal_used_queue()?;
+
+        self.check_stuck_inflight();
+
+        let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
+        if rate_limit_reached {
+            // Descriptors legitimately wait for the rate limiter; its own
+            // event resumes processing.
+            return Ok(());
+        }
+
+        let mem = self.mem.memory();
+        let avail_idx = self
+            .queue
+            .avail_idx(mem.deref(), Ordering::Acquire)
+            .map_err(|e| {
+                EpollHelperError::HandleEvent(anyhow!("Failed to read avail index: {e:?}"))
+            })?;
+        drop(mem);
+        if avail_idx != Wrapping(self.queue.next_avail()) {
+            warn!(
+                "Block queue {}: {} descriptor(s) published by the guest were never                  processed (missed queue notification?); recovering",
+                self.queue_index,
+                (avail_idx - Wrapping(self.queue.next_avail())).0,
+            );
+            self.process_queue_submit_and_signal()?;
+        }
+
+        Ok(())
+    }
+
+    // Drain all in-flight asynchronous I/O before the pause is acknowledged.
+    //
+    // The snapshot path serializes device state and then the guest memory
+    // image as soon as pause() returns. Requests still in flight at that
+    // point corrupt the snapshot twice over: the used ring in the memory
+    // image never records their completions (a restored clone rebuilds
+    // next_avail/next_used from the used-ring index, so it re-submits
+    // descriptors the guest considers outstanding — the guest-side
+    // "virtio_blk: id N is not a head!" wedge), and aligned reads DMA
+    // straight into guest memory whenever the kernel completes them,
+    // racing the memory serialization itself. Draining here makes the
+    // paused state truly quiescent: every submitted request is completed,
+    // published to the used ring, and no kernel-side writes into guest
+    // memory remain possible.
+    fn quiesce(&mut self, _helper: &mut EpollHelper) -> result::Result<(), EpollHelperError> {
+        // A device marked for reset stops harvesting completions; its
+        // queues are already considered broken, so there is nothing
+        // consistent to preserve.
+        if self.inflight_requests.is_empty() || self.needs_reset() {
+            return Ok(());
+        }
+
+        info!(
+            "Draining {} in-flight block request(s) on queue {} before pause",
+            self.inflight_requests.len(),
+            self.queue_index
+        );
+
+        let deadline = Instant::now() + PAUSE_QUIESCE_TIMEOUT;
+        let notifier_fd = self.disk_image.notifier().as_raw_fd();
+
+        loop {
+            // Clear the completion notification before harvesting so a
+            // completion arriving after the harvest re-signals the eventfd
+            // instead of being lost.
+            let _ = self.disk_image.notifier().read();
+
+            self.process_queue_complete().map_err(|e| {
+                EpollHelperError::HandleEvent(anyhow!(
+                    "Failed to process queue (complete) while quiescing: {e:?}"
+                ))
+            })?;
+
+            if self.inflight_requests.is_empty() {
+                break;
+            }
+
+            if Instant::now() >= deadline {
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Timed out draining in-flight block requests before pause: \
+                     {} request(s) still pending on queue {}",
+                    self.inflight_requests.len(),
+                    self.queue_index
+                )));
+            }
+
+            // Wait for the next completion notification (bounded slices so
+            // the deadline and racy notifications are both handled).
+            let mut pollfd = libc::pollfd {
+                fd: notifier_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pollfd points to a valid, initialized struct for the
+            // duration of the call.
+            let ret = unsafe { libc::poll(&mut pollfd, 1, PAUSE_QUIESCE_POLL_SLICE_MS) };
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(EpollHelperError::IoError(e));
+            }
+        }
+
+        // Publish the drained completions to the guest. With vCPUs already
+        // paused the interrupt is latched and re-triggered on resume; on
+        // the device-only pause path (e.g. disk resize) the running guest
+        // picks it up immediately.
+        self.try_signal_used_queue()
+    }
+
     fn handle_event(
         &mut self,
         _helper: &mut EpollHelper,
@@ -660,6 +874,13 @@ impl EpollHelperHandler for BlockEpollHandler {
                         "Failed to process queue (complete): {e:?}"
                     ))
                 })?;
+
+                // A busy queue never reaches handle_timeout, so a single
+                // stuck request hidden behind otherwise-flowing traffic is
+                // scanned for here, at most once per interval.
+                if self.last_stuck_inflight_check.elapsed() >= STUCK_INFLIGHT_CHECK_INTERVAL {
+                    self.check_stuck_inflight();
+                }
 
                 self.try_signal_used_queue()?;
 
@@ -1134,6 +1355,8 @@ impl VirtioDevice for Block {
                 // This gives head room for systems with slower I/O without
                 // compromising the cost of the reallocation or memory overhead
                 inflight_requests: VecDeque::with_capacity(64),
+                last_stuck_inflight_check: Instant::now(),
+                stuck_inflight_bucket: 0,
                 rate_limiter: self
                     .rate_limiter
                     .as_ref()
@@ -1250,3 +1473,257 @@ impl Snapshottable for Block {
 }
 impl Transportable for Block {}
 impl Migratable for Block {}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::thread;
+
+    use vm_memory::GuestAddress;
+    use vmm_sys_util::eventfd::EFD_NONBLOCK;
+
+    use super::*;
+
+    // Guest layout for the test queue.
+    const QUEUE_SIZE: u16 = 16;
+    const DESC_TABLE_ADDR: u64 = 0x0;
+    const AVAIL_RING_ADDR: u64 = 0x1000;
+    const USED_RING_ADDR: u64 = 0x2000;
+    const STATUS_ADDR_BASE: u64 = 0x8000;
+    const MEM_SIZE: usize = 1 << 20;
+
+    struct FakeAsyncIo {
+        notifier: EventFd,
+        completions: Arc<Mutex<VecDeque<(u64, i32)>>>,
+    }
+
+    impl AsyncIo for FakeAsyncIo {
+        fn notifier(&self) -> &EventFd {
+            &self.notifier
+        }
+
+        fn read_vectored(
+            &mut self,
+            _offset: libc::off_t,
+            _iovecs: &[libc::iovec],
+            _user_data: u64,
+        ) -> block::async_io::AsyncIoResult<()> {
+            Ok(())
+        }
+
+        fn write_vectored(
+            &mut self,
+            _offset: libc::off_t,
+            _iovecs: &[libc::iovec],
+            _user_data: u64,
+        ) -> block::async_io::AsyncIoResult<()> {
+            Ok(())
+        }
+
+        fn fsync(&mut self, _user_data: Option<u64>) -> block::async_io::AsyncIoResult<()> {
+            Ok(())
+        }
+
+        fn punch_hole(
+            &mut self,
+            _offset: u64,
+            _length: u64,
+            _user_data: u64,
+        ) -> block::async_io::AsyncIoResult<()> {
+            Ok(())
+        }
+
+        fn write_zeroes(
+            &mut self,
+            _offset: u64,
+            _length: u64,
+            _user_data: u64,
+        ) -> block::async_io::AsyncIoResult<()> {
+            Ok(())
+        }
+
+        fn next_completed_request(&mut self) -> Option<(u64, i32)> {
+            self.completions.lock().unwrap().pop_front()
+        }
+    }
+
+    struct NoopVirtioInterrupt {}
+
+    impl VirtioInterrupt for NoopVirtioInterrupt {
+        fn trigger(&self, _int_type: VirtioInterruptType) -> std::result::Result<(), io::Error> {
+            Ok(())
+        }
+
+        fn set_notifier(
+            &self,
+            _int_type: u32,
+            _notifier: Option<EventFd>,
+            _vm: &dyn hypervisor::Vm,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn inflight_read_request(head_index: u16) -> Request {
+        Request {
+            request_type: RequestType::In,
+            sector: 0,
+            data_descriptors: [(GuestAddress(0x10000), 512u32)].into_iter().collect(),
+            status_addr: GuestAddress(STATUS_ADDR_BASE + head_index as u64),
+            writeback: true,
+            aligned_operations: std::iter::empty().collect(),
+            start: Instant::now(),
+        }
+    }
+
+    fn test_handler(
+        inflight_heads: &[u16],
+        completions: Arc<Mutex<VecDeque<(u64, i32)>>>,
+        notifier: EventFd,
+    ) -> BlockEpollHandler {
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)]).unwrap(),
+        );
+
+        let mut queue = Queue::new(QUEUE_SIZE).unwrap();
+        queue.set_size(QUEUE_SIZE);
+        queue.try_set_desc_table_address(GuestAddress(DESC_TABLE_ADDR)).unwrap();
+        queue.try_set_avail_ring_address(GuestAddress(AVAIL_RING_ADDR)).unwrap();
+        queue.try_set_used_ring_address(GuestAddress(USED_RING_ADDR)).unwrap();
+        queue.set_ready(true);
+        // Pretend the popped-and-submitted chains advanced next_avail while
+        // their completions are still owed to the used ring.
+        queue.set_next_avail(inflight_heads.len() as u16);
+        queue.set_next_used(0);
+
+        let mut inflight_requests = VecDeque::new();
+        for head in inflight_heads {
+            inflight_requests.push_back((*head, inflight_read_request(*head)));
+        }
+
+        BlockEpollHandler {
+            queue_index: 0,
+            queue,
+            mem,
+            disk_image: Box::new(FakeAsyncIo {
+                notifier,
+                completions,
+            }),
+            disk_nsectors: Arc::new(AtomicU64::new(1024)),
+            interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
+            serial: Vec::new(),
+            kill_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+            pause_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+            writeback: Arc::new(AtomicBool::new(true)),
+            counters: BlockCounters::default(),
+            queue_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+            inflight_requests,
+            last_stuck_inflight_check: Instant::now(),
+            stuck_inflight_bucket: 0,
+            rate_limiter: None,
+            access_platform: None,
+            host_cpus: None,
+            acked_features: 0,
+            disable_sector0_writes: false,
+            device_status: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    fn test_epoll_helper(handler: &BlockEpollHandler) -> EpollHelper {
+        EpollHelper::new(&handler.kill_evt, &handler.pause_evt).unwrap()
+    }
+
+    #[test]
+    fn test_quiesce_no_inflight_is_noop() {
+        let completions = Arc::new(Mutex::new(VecDeque::new()));
+        let notifier = EventFd::new(EFD_NONBLOCK).unwrap();
+        let mut handler = test_handler(&[], completions, notifier);
+        let mut helper = test_epoll_helper(&handler);
+
+        handler.quiesce(&mut helper).unwrap();
+
+        assert!(handler.inflight_requests.is_empty());
+    }
+
+    #[test]
+    fn test_quiesce_drains_pending_completions() {
+        let completions = Arc::new(Mutex::new(VecDeque::from([(0u64, 512i32), (1u64, 512i32)])));
+        let notifier = EventFd::new(EFD_NONBLOCK).unwrap();
+        notifier.write(1).unwrap();
+        let mut handler = test_handler(&[0, 1], completions, notifier);
+        let mut helper = test_epoll_helper(&handler);
+
+        handler.quiesce(&mut helper).unwrap();
+
+        // Every in-flight request must have been completed and published to
+        // the used ring: a snapshot taken after pause now sees a quiescent,
+        // self-consistent queue (next_avail == next_used == used idx).
+        assert!(handler.inflight_requests.is_empty());
+        let mem = handler.mem.memory();
+        let used_idx = handler
+            .queue
+            .used_idx(mem.deref(), Ordering::Acquire)
+            .unwrap();
+        assert_eq!(used_idx.0, 2);
+        for head in [0u64, 1u64] {
+            let status: u8 = mem.read_obj(GuestAddress(STATUS_ADDR_BASE + head)).unwrap();
+            assert_eq!(status, VIRTIO_BLK_S_OK as u8);
+        }
+    }
+
+    #[test]
+    fn test_quiesce_waits_for_late_completion() {
+        let completions = Arc::new(Mutex::new(VecDeque::from([(0u64, 512i32)])));
+        let notifier = EventFd::new(EFD_NONBLOCK).unwrap();
+        notifier.write(1).unwrap();
+        let mut handler = test_handler(&[0, 1], Arc::clone(&completions), notifier);
+        let mut helper = test_epoll_helper(&handler);
+
+        // The second completion lands only after quiesce started waiting,
+        // mimicking kernel I/O that is still in flight when pause arrives.
+        let late_notifier = handler.disk_image.notifier().try_clone().unwrap();
+        let late = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            completions.lock().unwrap().push_back((1u64, 512i32));
+            late_notifier.write(1).unwrap();
+        });
+
+        handler.quiesce(&mut helper).unwrap();
+        late.join().unwrap();
+
+        assert!(handler.inflight_requests.is_empty());
+        let mem = handler.mem.memory();
+        let used_idx = handler
+            .queue
+            .used_idx(mem.deref(), Ordering::Acquire)
+            .unwrap();
+        assert_eq!(used_idx.0, 2);
+    }
+
+    #[test]
+    fn test_stuck_inflight_scan_buckets_and_resets() {
+        let completions = Arc::new(Mutex::new(VecDeque::new()));
+        let notifier = EventFd::new(EFD_NONBLOCK).unwrap();
+        let mut handler = test_handler(&[0], completions, notifier);
+
+        // Fresh request: no bucket.
+        handler.check_stuck_inflight();
+        assert_eq!(handler.stuck_inflight_bucket, 0);
+
+        // Age the request past the threshold: first escalation bucket.
+        handler.inflight_requests[0].1.start =
+            Instant::now() - STUCK_INFLIGHT_WARN_THRESHOLD - Duration::from_secs(1);
+        handler.check_stuck_inflight();
+        assert!(handler.stuck_inflight_bucket >= 1);
+        let reported = handler.stuck_inflight_bucket;
+
+        // Same age bucket: no re-escalation.
+        handler.check_stuck_inflight();
+        assert_eq!(handler.stuck_inflight_bucket, reported);
+
+        // Request completes (queue empties): bucket resets.
+        handler.inflight_requests.clear();
+        handler.check_stuck_inflight();
+        assert_eq!(handler.stuck_inflight_bucket, 0);
+    }
+}

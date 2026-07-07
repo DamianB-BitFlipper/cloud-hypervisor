@@ -12,9 +12,10 @@ use std::ops::{BitAnd, Not, Sub};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Barrier, Mutex};
+use std::time::{Duration, Instant};
 use std::{ffi, result, thread};
 
 use acpi_tables::{Aml, aml};
@@ -68,6 +69,70 @@ struct UffdRange {
     length: u64,
     file_offset: u64,
     page_size: u64,
+}
+
+/// A fault whose seek+read+copy completed but took at least this long is
+/// logged: slow fault service serializes every other faulting guest thread
+/// behind it (the handler is single-threaded), so latency here is the
+/// difference between an instant restore and a guest that freezes on any
+/// cold-page touch.
+const UFFD_SLOW_FAULT_WARN: Duration = Duration::from_millis(100);
+
+/// Cadence of the stall watchdog. A fault *stuck* in service never returns
+/// to produce a slow-fault log, so an independent thread has to report it;
+/// while it is stuck, every guest thread touching a cold page is blocked.
+const UFFD_STALL_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A fault arriving after at least this much handler idle logs the gap:
+/// bursts separated by long quiet are the signature of a guest that froze
+/// waiting on something else and resumed faulting when it recovered.
+const UFFD_IDLE_RESUME_LOG: Duration = Duration::from_secs(5);
+
+/// Progress line cadence in served pages (131072 × 4KiB = 512 MiB).
+const UFFD_PROGRESS_LOG_PAGES: u64 = 131_072;
+
+/// EAGAIN retry spins per warning; the retry loop is otherwise unbounded
+/// and silent.
+const UFFD_EAGAIN_WARN_SPINS: u64 = 100_000;
+
+/// Shared between the uffd handler thread and its stall watchdog.
+/// Millisecond stamps are relative to `epoch`, stored +1 so 0 means
+/// "no fault in service".
+struct UffdServiceState {
+    epoch: Instant,
+    fault_started_ms: AtomicU64,
+    fault_addr: AtomicU64,
+    fault_file_offset: AtomicU64,
+    pages_served: AtomicU64,
+    done: AtomicBool,
+}
+
+impl UffdServiceState {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            fault_started_ms: AtomicU64::new(0),
+            fault_addr: AtomicU64::new(0),
+            fault_file_offset: AtomicU64::new(0),
+            pages_served: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    fn begin_fault(&self, addr: u64) {
+        self.fault_addr.store(addr, Ordering::Relaxed);
+        self.fault_file_offset.store(0, Ordering::Relaxed);
+        self.fault_started_ms
+            .store(self.now_ms() + 1, Ordering::Release);
+    }
+
+    fn end_fault(&self) {
+        self.fault_started_ms.store(0, Ordering::Release);
+    }
 }
 
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
@@ -940,35 +1005,77 @@ impl MemoryManager {
         let thread_exit_evt = exit_evt.try_clone().map_err(Error::EventFdFail)?;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let service_state = Arc::new(UffdServiceState::new());
+        let handler_state = service_state.clone();
         let handle = thread::Builder::new()
             .name("uffd-handler".to_string())
             .spawn(move || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    let max_page_size = handler_ranges
-                        .iter()
-                        .map(|r| r.page_size)
-                        .max()
-                        .unwrap_or(base_page_size);
-                    let result = Self::uffd_handler_loop(
-                        uffd_fd,
-                        thread_stop_event,
-                        snapshot_file,
-                        &handler_ranges,
-                        max_page_size,
-                        &ready_tx,
-                    );
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+                    let handler_state = handler_state.clone();
+                    move || {
+                        let max_page_size = handler_ranges
+                            .iter()
+                            .map(|r| r.page_size)
+                            .max()
+                            .unwrap_or(base_page_size);
+                        let result = Self::uffd_handler_loop(
+                            uffd_fd,
+                            thread_stop_event,
+                            snapshot_file,
+                            &handler_ranges,
+                            max_page_size,
+                            &ready_tx,
+                            &handler_state,
+                        );
 
-                    if let Err(e) = &result {
-                        error!("UFFD handler exited with error: {e}");
+                        if let Err(e) = &result {
+                            error!(
+                                "UFFD handler exited with error — every guest thread that \
+                                 touches a not-yet-served page will block forever: {e}"
+                            );
+                        }
+
+                        result_tx.send(result).ok();
                     }
-
-                    result_tx.send(result).ok();
                 }))
                 .map_err(|_| {
                     error!("uffd-handler thread panicked");
                     thread_exit_evt.write(1).ok();
                 })
                 .ok();
+                handler_state.done.store(true, Ordering::Release);
+            })
+            .map_err(UffdError::SpawnThread)?;
+
+        // A fault stuck in service never returns to produce a completion
+        // log, so only an independent watchdog can report it; while it is
+        // stuck, every guest thread touching a cold page is blocked.
+        let watchdog_state = service_state;
+        thread::Builder::new()
+            .name("uffd-watchdog".to_string())
+            .spawn(move || {
+                loop {
+                    thread::sleep(UFFD_STALL_WATCHDOG_INTERVAL);
+                    if watchdog_state.done.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let started = watchdog_state.fault_started_ms.load(Ordering::Acquire);
+                    if started == 0 {
+                        continue;
+                    }
+                    let age_ms = (watchdog_state.now_ms() + 1).saturating_sub(started);
+                    if age_ms >= UFFD_STALL_WATCHDOG_INTERVAL.as_millis() as u64 {
+                        warn!(
+                            "UFFD fault service stalled: fault at {:#x} (snapshot file offset {:#x}) \
+                             in service for {}ms; guest threads touching cold pages are blocked \
+                             (pages served so far: {})",
+                            watchdog_state.fault_addr.load(Ordering::Relaxed),
+                            watchdog_state.fault_file_offset.load(Ordering::Relaxed),
+                            age_ms,
+                            watchdog_state.pages_served.load(Ordering::Relaxed),
+                        );
+                    }
+                }
             })
             .map_err(UffdError::SpawnThread)?;
 
@@ -1032,12 +1139,14 @@ impl MemoryManager {
         ranges: &[UffdRange],
         page_size: u64,
         ready_tx: &SyncSender<()>,
+        state: &UffdServiceState,
     ) -> Result<(), io::Error> {
         let uffd_raw_fd = uffd_fd.as_raw_fd();
         let mut page_buf = vec![0u8; page_size as usize];
 
         let total_pages: u64 = ranges.iter().map(|r| r.length.div_ceil(r.page_size)).sum();
         let mut pages_served: u64 = 0;
+        let mut last_fault_completed: Option<Instant> = None;
 
         const EVENT_STOP: u64 = 0;
         const EVENT_UFFD: u64 = 1;
@@ -1134,6 +1243,20 @@ impl MemoryManager {
 
             let fault_addr = msg.pf_address;
 
+            let fault_started = Instant::now();
+            if let Some(completed) = last_fault_completed {
+                let idle = fault_started.duration_since(completed);
+                if idle >= UFFD_IDLE_RESUME_LOG {
+                    info!(
+                        "UFFD fault service resumed after {}ms idle (pages served: {}/{})",
+                        idle.as_millis(),
+                        pages_served,
+                        total_pages,
+                    );
+                }
+            }
+            state.begin_fault(fault_addr);
+
             let mut served = false;
             for range in ranges {
                 // Round down to the page boundary containing the faulted address.
@@ -1141,10 +1264,12 @@ impl MemoryManager {
                 if page_addr >= range.host_addr && page_addr < range.host_addr + range.length {
                     let offset_in_range = page_addr - range.host_addr;
                     let file_pos = range.file_offset + offset_in_range;
+                    state.fault_file_offset.store(file_pos, Ordering::Relaxed);
 
                     snapshot_file.seek(SeekFrom::Start(file_pos))?;
                     snapshot_file.read_exact(&mut page_buf[..range.page_size as usize])?;
 
+                    let mut eagain_spins: u64 = 0;
                     loop {
                         match uffd::copy(
                             uffd_fd.as_fd(),
@@ -1154,6 +1279,7 @@ impl MemoryManager {
                         ) {
                             Ok(()) => {
                                 pages_served += 1;
+                                state.pages_served.store(pages_served, Ordering::Relaxed);
                                 break;
                             }
                             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
@@ -1167,6 +1293,12 @@ impl MemoryManager {
                             Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
                                 // The kernel can report a transient EAGAIN while the fault
                                 // is being resolved; yield and retry instead of aborting restore.
+                                eagain_spins += 1;
+                                if eagain_spins % UFFD_EAGAIN_WARN_SPINS == 0 {
+                                    warn!(
+                                        "UFFDIO_COPY at {page_addr:#x} still EAGAIN after {eagain_spins} retries",
+                                    );
+                                }
                                 thread::yield_now();
                             }
                             Err(e) => return Err(e),
@@ -1175,6 +1307,28 @@ impl MemoryManager {
                     served = true;
                     break;
                 }
+            }
+
+            state.end_fault();
+            let service_time = fault_started.elapsed();
+            last_fault_completed = Some(Instant::now());
+            if service_time >= UFFD_SLOW_FAULT_WARN {
+                // The handler is single-threaded: while this fault was in
+                // service, every other faulting guest thread was queued
+                // behind it.
+                warn!(
+                    "UFFD slow fault service: {}ms for page at {:#x} (pages served: {}/{})",
+                    service_time.as_millis(),
+                    fault_addr,
+                    pages_served,
+                    total_pages,
+                );
+            }
+            if served && pages_served > 0 && pages_served % UFFD_PROGRESS_LOG_PAGES == 0 {
+                info!(
+                    "UFFD restore progress: {}/{} pages served",
+                    pages_served, total_pages,
+                );
             }
 
             if !served {

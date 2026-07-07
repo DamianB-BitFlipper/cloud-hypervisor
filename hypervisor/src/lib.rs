@@ -141,6 +141,27 @@ pub enum CpuState {
     Mshv(mshv::VcpuMshvState),
 }
 
+#[cfg(target_arch = "x86_64")]
+impl CpuState {
+    /// The guest TSC (MSR_IA32_TSC) captured in this state, if present.
+    ///
+    /// Used to re-base the guest TSC at resume so it lands consistent with
+    /// the restored kvm-clock: the two are otherwise established at
+    /// different instants during restore and drift apart by that gap.
+    pub fn tsc(&self) -> Option<u64> {
+        match self {
+            #[cfg(feature = "kvm")]
+            CpuState::Kvm(state) => state
+                .msrs
+                .iter()
+                .find(|msr| msr.index == crate::arch::x86::msr_index::MSR_IA32_TSC)
+                .map(|msr| msr.data),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[cfg(target_arch = "x86_64")]
 pub enum ClockData {

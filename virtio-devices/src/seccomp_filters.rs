@@ -120,6 +120,15 @@ fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_io_submit, vec![]),
         (libc::SYS_io_uring_enter, vec![]),
         (libc::SYS_lseek, vec![]),
+        // The pause quiesce drain waits for in-flight completions with
+        // poll(2) on the disk notifier (glibc uses SYS_poll on x86_64,
+        // SYS_ppoll elsewhere/newer libcs). Without these the filter
+        // SIGSYS-kills the whole VMM — but only on the rare pause that
+        // actually has requests to drain, which made it a sporadic
+        // silent death during snapshot capture.
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_poll, vec![]),
+        (libc::SYS_ppoll, vec![]),
         (libc::SYS_pread64, vec![]),
         (libc::SYS_preadv, vec![]),
         (libc::SYS_pwritev, vec![]),

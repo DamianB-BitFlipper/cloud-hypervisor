@@ -3093,6 +3093,19 @@ impl Pausable for Vm {
         // TSC/kvmclock from the first instruction after resume.
         #[cfg(target_arch = "x86_64")]
         {
+            // Re-base the guest TSC to its saved value here, adjacent to the
+            // clock restore below, rather than leaving it at the value
+            // written during VM construction. The two must be established at
+            // the same instant: otherwise the guest resumes with its TSC and
+            // kvm-clock skewed by the restore latency between construction
+            // and now, tripping the guest clocksource watchdog under load.
+            // See CpuManager::reset_vcpus_tsc.
+            self.cpu_manager
+                .lock()
+                .unwrap()
+                .reset_vcpus_tsc()
+                .map_err(|e| MigratableError::Resume(anyhow!("Could not re-base vCPU TSC: {e}")))?;
+
             if let Some(clock) = &self.saved_clock {
                 self.vm
                     .set_clock(clock)
