@@ -46,7 +46,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
-use std::{cmp, mem, result};
+use std::{cmp, fs, mem, result};
 
 #[cfg(feature = "io_uring")]
 use io_uring::{IoUring, Probe, opcode};
@@ -904,6 +904,46 @@ pub fn probe_sparse_support(file: &File) -> bool {
     }
 }
 
+/// Probe whether the file/device supports WRITE_ZEROES requests.
+pub fn probe_write_zeroes_support(file: &File) -> bool {
+    let fd = file.as_raw_fd();
+
+    let device = match stat_device(fd) {
+        Ok(device) => device,
+        Err(err) => {
+            warn!("Failed to stat file descriptor for write zeroes probe: {err}");
+            return false;
+        }
+    };
+
+    if device.is_block {
+        probe_block_device_write_zeroes_support(device.rdev, Path::new("/sys"))
+    } else {
+        probe_sparse_support(file)
+    }
+}
+
+struct StatDevice {
+    is_block: bool,
+    rdev: libc::dev_t,
+}
+
+fn stat_device(fd: libc::c_int) -> io::Result<StatDevice> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: FFI call with valid fd and buffer
+    let ret = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: stat result is valid at this point
+    let stat = unsafe { stat.assume_init() };
+    Ok(StatDevice {
+        is_block: stat.st_mode & S_IFMT == S_IFBLK,
+        rdev: stat.st_rdev,
+    })
+}
+
 /// Probe sparse support for a regular file using fallocate().
 fn probe_file_sparse_support(fd: libc::c_int) -> bool {
     // SAFETY: FFI call with valid fd
@@ -960,6 +1000,37 @@ fn probe_file_sparse_support(fd: libc::c_int) -> bool {
 fn probe_block_device_sparse_support(_fd: libc::c_int) -> bool {
     info!("Block device: assuming sparse support");
     true
+}
+
+fn probe_block_device_write_zeroes_support(rdev: libc::dev_t, sysfs_root: &Path) -> bool {
+    let major = libc::major(rdev);
+    let minor = libc::minor(rdev);
+    let queue_limit_path = sysfs_root
+        .join("dev/block")
+        .join(format!("{major}:{minor}"))
+        .join("queue/write_zeroes_max_bytes");
+
+    let value = match fs::read_to_string(&queue_limit_path) {
+        Ok(value) => value,
+        Err(err) => {
+            info!("Block device write zeroes probe could not read {queue_limit_path:?}: {err}");
+            return false;
+        }
+    };
+
+    let limit = match value.trim().parse::<u64>() {
+        Ok(limit) => limit,
+        Err(err) => {
+            warn!("Block device write zeroes probe could not parse {queue_limit_path:?}: {err}");
+            return false;
+        }
+    };
+
+    let supported = limit > 0;
+    info!(
+        "Block device write zeroes probe: path={queue_limit_path:?}, write_zeroes_max_bytes={limit} => {supported}"
+    );
+    supported
 }
 
 /// Preallocate disk space for a disk image file.
@@ -1258,6 +1329,37 @@ pub fn query_device_size(file: &File) -> io::Result<(u64, u64)> {
     }
 }
 
+/// Resize a regular raw image, or verify that an externally resized block
+/// device already reports the requested capacity.
+pub(crate) fn resize_raw_file(file: &File, size: u64) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_block_device() {
+        let (actual_size, _) = query_device_size(file)?;
+        if actual_size != size {
+            return Err(io::Error::other(format!(
+                "Block device size {actual_size} does not match requested size {size}"
+            )));
+        }
+        Ok(())
+    } else {
+        file.set_len(size)
+    }
+}
+
+#[cfg(test)]
+mod raw_file_resize_tests {
+    use vmm_sys_util::tempfile::TempFile;
+
+    use super::resize_raw_file;
+
+    #[test]
+    fn regular_raw_file_is_resized_with_set_len() {
+        let temp = TempFile::new().unwrap();
+        resize_raw_file(temp.as_file(), 4096).unwrap();
+        assert_eq!(temp.as_file().metadata().unwrap().len(), 4096);
+    }
+}
+
 #[derive(Copy, Clone)]
 enum BlockSize {
     LogicalBlock,
@@ -1385,11 +1487,12 @@ impl DiskTopology {
 #[cfg(test)]
 mod unit_tests {
     use std::alloc::{Layout, alloc_zeroed, dealloc};
-    use std::fs::OpenOptions;
+    use std::fs::{OpenOptions, create_dir_all, write};
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::{ptr, slice};
 
+    use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -1569,5 +1672,60 @@ mod unit_tests {
         let f = std::fs::File::open("/dev/zero").unwrap();
         let err = query_device_size(&f).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_probe_block_device_write_zeroes_support_from_sysfs_positive_limit() {
+        let sysfs_root = TempDir::new().unwrap();
+        let dev = libc::makedev(43, 7);
+        let queue_dir = sysfs_root.as_path().join("dev/block/43:7/queue");
+        create_dir_all(&queue_dir).unwrap();
+        write(queue_dir.join("write_zeroes_max_bytes"), "4096\n").unwrap();
+
+        assert!(probe_block_device_write_zeroes_support(
+            dev,
+            sysfs_root.as_path()
+        ));
+    }
+
+    #[test]
+    fn test_probe_block_device_write_zeroes_support_from_sysfs_zero_limit() {
+        let sysfs_root = TempDir::new().unwrap();
+        let dev = libc::makedev(43, 8);
+        let queue_dir = sysfs_root.as_path().join("dev/block/43:8/queue");
+        create_dir_all(&queue_dir).unwrap();
+        write(queue_dir.join("write_zeroes_max_bytes"), "0\n").unwrap();
+
+        assert!(!probe_block_device_write_zeroes_support(
+            dev,
+            sysfs_root.as_path()
+        ));
+    }
+
+    #[test]
+    fn test_probe_block_device_write_zeroes_support_from_sysfs_missing_file() {
+        let sysfs_root = TempDir::new().unwrap();
+        let dev = libc::makedev(43, 9);
+        let queue_dir = sysfs_root.as_path().join("dev/block/43:9/queue");
+        create_dir_all(&queue_dir).unwrap();
+
+        assert!(!probe_block_device_write_zeroes_support(
+            dev,
+            sysfs_root.as_path()
+        ));
+    }
+
+    #[test]
+    fn test_probe_block_device_write_zeroes_support_from_sysfs_invalid_value() {
+        let sysfs_root = TempDir::new().unwrap();
+        let dev = libc::makedev(43, 10);
+        let queue_dir = sysfs_root.as_path().join("dev/block/43:10/queue");
+        create_dir_all(&queue_dir).unwrap();
+        write(queue_dir.join("write_zeroes_max_bytes"), "wat\n").unwrap();
+
+        assert!(!probe_block_device_write_zeroes_support(
+            dev,
+            sysfs_root.as_path()
+        ));
     }
 }

@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+use crate::resize_raw_file;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -12,7 +13,10 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
-use crate::{DiskTopology, SECTOR_SIZE, disk_file, probe_sparse_support, query_device_size};
+use crate::{
+    DiskTopology, SECTOR_SIZE, disk_file, probe_sparse_support, probe_write_zeroes_support,
+    query_device_size,
+};
 
 #[derive(Debug)]
 pub struct RawFileDiskSync {
@@ -60,12 +64,15 @@ impl disk_file::SparseCapable for RawFileDiskSync {
     fn supports_sparse_operations(&self) -> bool {
         probe_sparse_support(&self.file)
     }
+
+    fn supports_write_zeroes(&self) -> bool {
+        probe_write_zeroes_support(&self.file)
+    }
 }
 
 impl disk_file::Resizable for RawFileDiskSync {
     fn resize(&mut self, size: u64) -> BlockResult<()> {
-        self.file
-            .set_len(size)
+        resize_raw_file(&self.file, size)
             .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::ResizeError(e)))
     }
 }

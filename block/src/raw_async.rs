@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::fs::File;
-use std::io::{self, Error};
-use std::os::unix::fs::FileTypeExt;
+use std::io::Error;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use io_uring::{IoUring, opcode, types};
@@ -16,7 +15,7 @@ use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, Disk
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::{
     BatchRequest, DiskTopology, RequestType, SECTOR_SIZE, disk_file, probe_sparse_support,
-    query_device_size,
+    probe_write_zeroes_support, query_device_size, resize_raw_file,
 };
 
 #[derive(Debug)]
@@ -65,34 +64,16 @@ impl disk_file::SparseCapable for RawFileDisk {
     fn supports_sparse_operations(&self) -> bool {
         probe_sparse_support(&self.file)
     }
+
+    fn supports_write_zeroes(&self) -> bool {
+        probe_write_zeroes_support(&self.file)
+    }
 }
 
 impl disk_file::Resizable for RawFileDisk {
     fn resize(&mut self, size: u64) -> BlockResult<()> {
-        let fd_metadata = self
-            .file
-            .metadata()
-            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::ResizeError(e)))?;
-
-        if fd_metadata.file_type().is_block_device() {
-            // Block devices cannot be resized via ftruncate - they are resized
-            // externally (LVM, losetup -c, etc.). Verify the size matches.
-            let (actual_size, _) = query_device_size(&self.file)
-                .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::ResizeError(e)))?;
-            if actual_size != size {
-                return Err(BlockError::new(
-                    BlockErrorKind::Io,
-                    DiskFileError::ResizeError(io::Error::other(format!(
-                        "Block device size {actual_size} does not match requested size {size}"
-                    ))),
-                ));
-            }
-            Ok(())
-        } else {
-            self.file
-                .set_len(size)
-                .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::ResizeError(e)))
-        }
+        resize_raw_file(&self.file, size)
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::ResizeError(e)))
     }
 }
 
