@@ -13,9 +13,10 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
+use crate::sparse::{blkdiscard, blkzeroout};
 use crate::{
-    BatchRequest, DiskTopology, RequestType, SECTOR_SIZE, disk_file, probe_sparse_support,
-    probe_write_zeroes_support, query_device_size, resize_raw_file,
+    BatchRequest, DiskTopology, RequestType, SECTOR_SIZE, disk_file, is_block_device,
+    probe_sparse_support, probe_write_zeroes_support, query_device_size, resize_raw_file,
 };
 
 #[derive(Debug)]
@@ -102,6 +103,7 @@ pub struct RawFileAsync {
     io_uring: IoUring,
     eventfd: EventFd,
     alignment: u64,
+    is_block_device: bool,
 }
 
 impl RawFileAsync {
@@ -113,12 +115,30 @@ impl RawFileAsync {
         // the completion queue is ready.
         io_uring.submitter().register_eventfd(eventfd.as_raw_fd())?;
 
+        let is_block_device = is_block_device(fd);
+
         Ok(RawFileAsync {
             fd,
             io_uring,
             eventfd,
             alignment: SECTOR_SIZE,
+            is_block_device,
         })
+    }
+
+    /// Submit a no-op carrying `user_data` so a synchronously completed block
+    /// ioctl is delivered through the normal io_uring completion path.
+    fn submit_nop(&mut self, user_data: u64) -> Result<(), Error> {
+        let (submitter, mut sq, _) = self.io_uring.split();
+        // SAFETY: Nop has no buffer; only `user_data` is consumed by the
+        // kernel.
+        unsafe {
+            sq.push(&opcode::Nop::new().build().user_data(user_data))
+                .map_err(|e| Error::other(format!("Submission queue is full: {e:?}")))?;
+        }
+        sq.sync();
+        submitter.submit()?;
+        Ok(())
     }
 }
 
@@ -294,6 +314,11 @@ impl AsyncIo for RawFileAsync {
     }
 
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
+        if self.is_block_device {
+            blkdiscard(self.fd, offset, length).map_err(AsyncIoError::PunchHole)?;
+            return self.submit_nop(user_data).map_err(AsyncIoError::PunchHole);
+        }
+
         let (submitter, mut sq, _) = self.io_uring.split();
 
         let mode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
@@ -319,6 +344,13 @@ impl AsyncIo for RawFileAsync {
     }
 
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
+        if self.is_block_device {
+            blkzeroout(self.fd, offset, length).map_err(AsyncIoError::WriteZeroes)?;
+            return self
+                .submit_nop(user_data)
+                .map_err(AsyncIoError::WriteZeroes);
+        }
+
         let (submitter, mut sq, _) = self.io_uring.split();
 
         let mode = FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE;

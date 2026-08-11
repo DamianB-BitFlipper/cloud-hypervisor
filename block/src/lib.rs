@@ -31,6 +31,8 @@ pub mod raw_async_aio;
 #[cfg(test)]
 mod raw_async_io_tests;
 pub mod raw_sync;
+mod sparse;
+pub use sparse::{BLKDISCARD, BLKZEROOUT};
 pub mod vhd;
 pub mod vhdx;
 pub mod vhdx_sync;
@@ -926,6 +928,14 @@ pub fn probe_write_zeroes_support(file: &File) -> bool {
 struct StatDevice {
     is_block: bool,
     rdev: libc::dev_t,
+}
+
+/// Returns `true` when `fd` refers to a block device.
+///
+/// A failed `fstat()` is treated as a regular file so the raw backends retain
+/// their existing `fallocate()` behavior.
+pub(crate) fn is_block_device(fd: libc::c_int) -> bool {
+    stat_device(fd).is_ok_and(|device| device.is_block)
 }
 
 fn stat_device(fd: libc::c_int) -> io::Result<StatDevice> {

@@ -896,9 +896,14 @@ fn main() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    // Ensure all created files (.e.g sockets) are only accessible by this user
+    // Ensure all created files (e.g. sockets, logs) are accessible only by
+    // this user and its group. The sandbox host runs cloud-hypervisor under a
+    // dedicated user and shares its artifacts with the node agent through
+    // setgid workspace directories, so group access is the sharing contract
+    // (upstream uses 0o077; do not tighten this without restoring host-side
+    // permission repair).
     // SAFETY: trivially safe
-    let _ = unsafe { libc::umask(0o077) };
+    let _ = unsafe { libc::umask(0o007) };
 
     let (default_vcpus, default_memory, default_rng) = prepare_default_values();
     let cmd_arguments = create_app(default_vcpus, default_memory, default_rng).get_matches();
