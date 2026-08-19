@@ -4,14 +4,16 @@
 
 //! Minimal userfaultfd bindings for demand-paged snapshot restore.
 //!
-//! Uses the `userfaultfd(2)` syscall (available since Linux 4.3) to create a
-//! fault descriptor, then `UFFDIO_API` / `UFFDIO_REGISTER` / `UFFDIO_COPY`
-//! ioctls to handle page faults from a background thread.
+//! Uses `/dev/userfaultfd` to create a fault descriptor, then `UFFDIO_API` /
+//! `UFFDIO_REGISTER` / `UFFDIO_COPY` ioctls to handle page faults from a
+//! background thread. Device permissions can grant this access to Cloud
+//! Hypervisor without enabling `vm.unprivileged_userfaultfd` globally.
 //!
 //! Unlike an mmap(MAP_PRIVATE) overlay approach, UFFD does not replace the
 //! original memory mapping, so it remains compatible with VFIO device
 //! passthrough and shared-memory-backed guest RAM.
 
+use std::fs::OpenOptions;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use crate::userfaultfd;
@@ -61,8 +63,19 @@ const _: () = assert!(std::mem::size_of::<UffdMsg>() == 32);
 
 /// Create a userfaultfd file descriptor and perform the API handshake.
 pub(crate) fn create(required_features: u64) -> Result<OwnedFd, std::io::Error> {
-    // SAFETY: `userfaultfd` syscall with O_CLOEXEC | O_NONBLOCK flags.
-    let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    let control = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/userfaultfd")?;
+    // SAFETY: `control` is an open /dev/userfaultfd descriptor and the ioctl
+    // returns a new descriptor using the same flags accepted by userfaultfd(2).
+    let fd = unsafe {
+        libc::ioctl(
+            control.as_raw_fd(),
+            userfaultfd::USERFAULTFD_IOC_NEW as libc::Ioctl,
+            libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }

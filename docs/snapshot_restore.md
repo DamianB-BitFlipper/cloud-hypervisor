@@ -121,6 +121,7 @@ back to `copy`.
 
 Current constraints for `memory_restore_mode=ondemand`:
 
+- `/dev/userfaultfd` must be accessible to the Cloud Hypervisor process
 - `prefault=on` is not supported
 - the snapshot memory ranges must be page-aligned
 

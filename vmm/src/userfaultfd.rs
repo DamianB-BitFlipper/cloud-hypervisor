@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // See include/uapi/linux/userfaultfd.h in the kernel code.
+pub const USERFAULTFD_IOC_NEW: u64 = 0x0000_aa00; // _IO(0xAA, 0x00)
 pub const UFFDIO_API: u64 = 0xc018_aa3f; // _IOWR(0xAA, 0x3F, struct uffdio_api)
 pub const UFFDIO_REGISTER: u64 = 0xc020_aa00; // _IOWR(0xAA, 0x00, struct uffdio_register)
 pub const UFFDIO_COPY: u64 = 0xc028_aa03; // _IOWR(0xAA, 0x03, struct uffdio_copy)
@@ -15,12 +16,14 @@ const fn ioctl_ioc(dir: u64, typ: u64, nr: u64, size: u64) -> u64 {
 }
 const IOC_READ: u64 = 2;
 const IOC_READWRITE: u64 = 3;
+const _: () = assert!(USERFAULTFD_IOC_NEW == ioctl_ioc(0, 0xAA, 0x00, 0));
 const _: () = assert!(UFFDIO_API == ioctl_ioc(IOC_READWRITE, 0xAA, 0x3F, 24));
 const _: () = assert!(UFFDIO_REGISTER == ioctl_ioc(IOC_READWRITE, 0xAA, 0x00, 32));
 const _: () = assert!(UFFDIO_COPY == ioctl_ioc(IOC_READWRITE, 0xAA, 0x03, 40));
 const _: () = assert!(UFFDIO_WAKE == ioctl_ioc(IOC_READ, 0xAA, 0x02, 16));
 
 // Seccomp compares these as Dword (u32); ensure they fit.
+const _: () = assert!(USERFAULTFD_IOC_NEW <= u32::MAX as u64);
 const _: () = assert!(UFFDIO_API <= u32::MAX as u64);
 const _: () = assert!(UFFDIO_REGISTER <= u32::MAX as u64);
 const _: () = assert!(UFFDIO_COPY <= u32::MAX as u64);

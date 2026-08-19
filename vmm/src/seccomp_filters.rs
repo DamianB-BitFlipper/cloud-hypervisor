@@ -25,7 +25,9 @@ use vhost::vhost_kern::vhost_binding::{
     VHOST_VDPA_SET_STATUS, VHOST_VDPA_SET_VRING_ENABLE, VHOST_VDPA_SUSPEND,
 };
 
-use crate::userfaultfd::{UFFDIO_API, UFFDIO_COPY, UFFDIO_REGISTER, UFFDIO_WAKE};
+use crate::userfaultfd::{
+    UFFDIO_API, UFFDIO_COPY, UFFDIO_REGISTER, UFFDIO_WAKE, USERFAULTFD_IOC_NEW,
+};
 
 #[derive(Copy, Clone)]
 pub enum Thread {
@@ -400,6 +402,7 @@ fn create_vmm_ioctl_seccomp_rule_common(
             VHOST_VDPA_GET_CONFIG_SIZE()
         )?],
         and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_SUSPEND())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, USERFAULTFD_IOC_NEW)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_API)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_COPY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_REGISTER)?],
@@ -734,7 +737,6 @@ fn vmm_thread_rules(
         (libc::SYS_unlink, vec![]),
         #[cfg(target_arch = "aarch64")]
         (libc::SYS_unlinkat, vec![]),
-        (libc::SYS_userfaultfd, vec![]),
         (libc::SYS_wait4, vec![]),
         (libc::SYS_write, vec![]),
         (libc::SYS_writev, vec![]),
