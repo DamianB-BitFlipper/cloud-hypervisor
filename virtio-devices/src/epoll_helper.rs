@@ -93,6 +93,13 @@ pub trait EpollHelperHandler {
     fn quiesce(&mut self, _helper: &mut EpollHelper) -> Result<(), EpollHelperError> {
         Ok(())
     }
+
+    // Return true when quiesce() waits for events from the helper's epoll set.
+    // The pause event is temporarily removed for such handlers so its shared,
+    // level-triggered eventfd cannot starve the events quiesce is waiting for.
+    fn quiesce_waits_for_epoll_events(&self) -> bool {
+        false
+    }
 }
 
 impl EpollHelper {
@@ -112,7 +119,7 @@ impl EpollHelper {
         };
 
         helper.add_event(kill_evt.as_raw_fd(), EPOLL_HELPER_EVENT_KILL)?;
-        helper.add_event(pause_evt.as_raw_fd(), EPOLL_HELPER_EVENT_PAUSE)?;
+        helper.add_event(helper.pause_evt.as_raw_fd(), EPOLL_HELPER_EVENT_PAUSE)?;
         Ok(helper)
     }
 
@@ -163,6 +170,20 @@ impl EpollHelper {
             epoll::Event::new(evts, id.into()),
         )
         .map_err(EpollHelperError::Ctl)
+    }
+
+    pub fn wait_for_events(
+        &self,
+        timeout: i32,
+        events: &mut [epoll::Event],
+    ) -> std::result::Result<usize, EpollHelperError> {
+        loop {
+            match epoll::wait(self.epoll_file.as_raw_fd(), timeout, events) {
+                Ok(num_events) => return Ok(num_events),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(EpollHelperError::Wait(e)),
+            }
+        }
     }
 
     pub fn run(
@@ -235,13 +256,41 @@ impl EpollHelper {
                     EPOLL_HELPER_EVENT_PAUSE => {
                         info!("PAUSE_EVENT received, pausing epoll loop");
 
+                        // The shared pause eventfd stays readable until every
+                        // device thread has acknowledged the pause. Remove it
+                        // from this thread's epoll set while quiescing so the
+                        // handler can wait on its ordinary completion events
+                        // without busy-spinning on the pause notification.
+                        let quiesce_waits_for_epoll_events =
+                            handler.quiesce_waits_for_epoll_events();
+                        let pause_event_removed = if quiesce_waits_for_epoll_events {
+                            match self.del_event_custom(
+                                self.pause_evt.as_raw_fd(),
+                                EPOLL_HELPER_EVENT_PAUSE,
+                                epoll::Events::EPOLLIN,
+                            ) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    error!(
+                                        "Failed to suspend pause event while quiescing: {e:?}"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+
                         // Quiesce in-flight work before acknowledging the
                         // pause. A quiesce failure is logged rather than
                         // propagated: the barrier below must always be
                         // reached or the VMM's pause() call deadlocks, and
                         // parking with residual in-flight work matches the
                         // previous behavior.
-                        if let Err(e) = handler.quiesce(self) {
+                        let can_quiesce = !quiesce_waits_for_epoll_events || pause_event_removed;
+                        if can_quiesce
+                            && let Err(e) = handler.quiesce(self)
+                        {
                             error!("Failed to quiesce handler before pause: {e:?}");
                         }
 
@@ -260,6 +309,15 @@ impl EpollHelper {
                         // This ensures the pause event has been seen by each
                         // thread related to this virtio device.
                         let _ = self.pause_evt.read();
+                        if pause_event_removed {
+                            self.add_event(self.pause_evt.as_raw_fd(), EPOLL_HELPER_EVENT_PAUSE)?;
+
+                            // Discard the rest of this epoll batch. Events
+                            // returned alongside PAUSE may have been consumed
+                            // by quiesce and must be observed again from current
+                            // fd readiness.
+                            break;
+                        }
                     }
                     _ => {
                         handler.handle_event(self, event)?;
@@ -317,13 +375,36 @@ impl EpollHelper {
                     EPOLL_HELPER_EVENT_PAUSE => {
                         info!("PAUSE_EVENT received, pausing epoll loop");
 
+                        let quiesce_waits_for_epoll_events =
+                            handler.quiesce_waits_for_epoll_events();
+                        let pause_event_removed = if quiesce_waits_for_epoll_events {
+                            match self.del_event_custom(
+                                self.pause_evt.as_raw_fd(),
+                                EPOLL_HELPER_EVENT_PAUSE,
+                                epoll::Events::EPOLLIN,
+                            ) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    error!(
+                                        "Failed to suspend pause event while quiescing: {e:?}"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+
                         // Quiesce in-flight work before acknowledging the
                         // pause. A quiesce failure is logged rather than
                         // propagated: the barrier below must always be
                         // reached or the VMM's pause() call deadlocks, and
                         // parking with residual in-flight work matches the
                         // previous behavior.
-                        if let Err(e) = handler.quiesce(self) {
+                        let can_quiesce = !quiesce_waits_for_epoll_events || pause_event_removed;
+                        if can_quiesce
+                            && let Err(e) = handler.quiesce(self)
+                        {
                             error!("Failed to quiesce handler before pause: {e:?}");
                         }
 
@@ -342,6 +423,10 @@ impl EpollHelper {
                         // This ensures the pause event has been seen by each
                         // thread related to this virtio device.
                         let _ = self.pause_evt.read();
+                        if pause_event_removed {
+                            self.add_event(self.pause_evt.as_raw_fd(), EPOLL_HELPER_EVENT_PAUSE)?;
+                            break;
+                        }
                     }
                     _ => {
                         handler.handle_event(self, event)?;
@@ -355,5 +440,118 @@ impl EpollHelper {
 impl AsRawFd for EpollHelper {
     fn as_raw_fd(&self) -> RawFd {
         self.epoll_file.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc::{self, Sender};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    use super::*;
+
+    const TEST_COMPLETION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
+
+    struct QuiescingHandler {
+        completion_evt: EventFd,
+        quiesce_count: Arc<AtomicUsize>,
+        quiesce_started_tx: Sender<()>,
+        handled_tx: Sender<()>,
+    }
+
+    impl EpollHelperHandler for QuiescingHandler {
+        fn handle_event(
+            &mut self,
+            _helper: &mut EpollHelper,
+            event: &epoll::Event,
+        ) -> Result<(), EpollHelperError> {
+            if event.data as u16 != TEST_COMPLETION_EVENT {
+                return Err(EpollHelperError::IoError(std::io::Error::other(
+                    "unexpected test event",
+                )));
+            }
+            self.completion_evt
+                .read()
+                .map_err(EpollHelperError::IoError)?;
+            self.handled_tx.send(()).unwrap();
+            Ok(())
+        }
+
+        fn quiesce(&mut self, helper: &mut EpollHelper) -> Result<(), EpollHelperError> {
+            self.quiesce_started_tx.send(()).unwrap();
+            let mut events = [epoll::Event::new(epoll::Events::empty(), 0); 1];
+            let num_events = helper.wait_for_events(2_000, &mut events)?;
+            if num_events != 1 || events[0].data as u16 != TEST_COMPLETION_EVENT {
+                return Err(EpollHelperError::IoError(std::io::Error::other(
+                    "completion event did not wake quiesce",
+                )));
+            }
+            self.completion_evt
+                .read()
+                .map_err(EpollHelperError::IoError)?;
+            self.quiesce_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn quiesce_waits_for_epoll_events(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_pause_quiesce_uses_epoll_and_rearms_pause_event() {
+        let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let pause_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let completion_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut helper = EpollHelper::new(&kill_evt, &pause_evt).unwrap();
+        helper
+            .add_event(completion_evt.as_raw_fd(), TEST_COMPLETION_EVENT)
+            .unwrap();
+
+        let paused = Arc::new(AtomicBool::new(false));
+        let paused_sync = Arc::new(Barrier::new(2));
+        let quiesce_count = Arc::new(AtomicUsize::new(0));
+        let (quiesce_started_tx, quiesce_started_rx) = mpsc::channel();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let mut handler = QuiescingHandler {
+            completion_evt: completion_evt.try_clone().unwrap(),
+            quiesce_count: Arc::clone(&quiesce_count),
+            quiesce_started_tx,
+            handled_tx,
+        };
+        let thread_paused = Arc::clone(&paused);
+        let thread_paused_sync = Arc::clone(&paused_sync);
+        let worker =
+            thread::spawn(move || helper.run(&thread_paused, &thread_paused_sync, &mut handler));
+
+        // Prove the worker entered its epoll loop before initiating pause;
+        // workers created for an already-paused restore intentionally park
+        // before observing events.
+        completion_evt.write(1).unwrap();
+        handled_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        for expected_count in 1usize..=2 {
+            paused.store(true, Ordering::SeqCst);
+            pause_evt.write(1).unwrap();
+            quiesce_started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            completion_evt.write(1).unwrap();
+            paused_sync.wait();
+            assert_eq!(quiesce_count.load(Ordering::SeqCst), expected_count);
+
+            paused.store(false, Ordering::SeqCst);
+            worker.thread().unpark();
+
+            // A normal event proves the worker resumed and re-armed its epoll
+            // set before the next pause cycle.
+            completion_evt.write(1).unwrap();
+            handled_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+
+        kill_evt.write(1).unwrap();
+        worker.join().unwrap().unwrap();
     }
 }

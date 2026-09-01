@@ -49,6 +49,7 @@ use super::{
     EpollHelperHandler, Error as DeviceError, VirtioCommon, VirtioDevice, VirtioDeviceType,
     VirtioInterruptType,
 };
+use crate::epoll_helper::EPOLL_HELPER_EVENT_KILL;
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::{GuestMemoryMmap, VirtioInterrupt};
@@ -686,10 +687,9 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
 // pause() call.
 const PAUSE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(20);
 
-// Poll slice while draining: short enough to re-harvest promptly if a
-// completion slipped in between harvesting and polling, long enough to not
-// busy-spin against a slow disk.
-const PAUSE_QUIESCE_POLL_SLICE_MS: i32 = 100;
+// Epoll slice while draining: short enough to re-check the deadline, long
+// enough to avoid busy-spinning against a slow disk.
+const PAUSE_QUIESCE_WAIT_SLICE_MS: i32 = 100;
 
 // How long the block queue thread may sit with no epoll events before the
 // liveness watchdog runs (epoll_wait timeout). A healthy busy queue never
@@ -710,6 +710,10 @@ const STUCK_INFLIGHT_WARN_THRESHOLD: Duration = Duration::from_secs(10);
 const STUCK_INFLIGHT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 impl EpollHelperHandler for BlockEpollHandler {
+    fn quiesce_waits_for_epoll_events(&self) -> bool {
+        true
+    }
+
     // Queue-liveness watchdog, reached only when the epoll loop saw no
     // events for QUEUE_WATCHDOG_INTERVAL_MS. A healthy idle queue exits
     // cheaply; a wedged one gets three checks:
@@ -777,7 +781,7 @@ impl EpollHelperHandler for BlockEpollHandler {
     // paused state truly quiescent: every submitted request is completed,
     // published to the used ring, and no kernel-side writes into guest
     // memory remain possible.
-    fn quiesce(&mut self, _helper: &mut EpollHelper) -> result::Result<(), EpollHelperError> {
+    fn quiesce(&mut self, helper: &mut EpollHelper) -> result::Result<(), EpollHelperError> {
         // A device marked for reset stops harvesting completions; its
         // queues are already considered broken, so there is nothing
         // consistent to preserve.
@@ -792,7 +796,7 @@ impl EpollHelperHandler for BlockEpollHandler {
         );
 
         let deadline = Instant::now() + PAUSE_QUIESCE_TIMEOUT;
-        let notifier_fd = self.disk_image.notifier().as_raw_fd();
+        let mut events = [epoll::Event::new(epoll::Events::empty(), 0); 4];
 
         loop {
             // Clear the completion notification before harvesting so a
@@ -819,22 +823,43 @@ impl EpollHelperHandler for BlockEpollHandler {
                 )));
             }
 
-            // Wait for the next completion notification (bounded slices so
-            // the deadline and racy notifications are both handled).
-            let mut pollfd = libc::pollfd {
-                fd: notifier_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: pollfd points to a valid, initialized struct for the
-            // duration of the call.
-            let ret = unsafe { libc::poll(&mut pollfd, 1, PAUSE_QUIESCE_POLL_SLICE_MS) };
-            if ret < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
+            // Keep using the worker's epoll set while quiescing. Completion
+            // events are harvested at the top of the loop, while queue and
+            // rate-limiter notifications are only consumed: resume re-kicks
+            // the queue after the pause barrier releases, so no new request
+            // can enter the in-flight set during the drain.
+            let num_events = helper.wait_for_events(PAUSE_QUIESCE_WAIT_SLICE_MS, &mut events)?;
+            for event in events.iter().take(num_events) {
+                match event.data as u16 {
+                    COMPLETION_EVENT => {}
+                    QUEUE_AVAIL_EVENT => {
+                        let _ = self.queue_evt.read();
+                    }
+                    RATE_LIMITER_EVENT => {
+                        if let Some(rate_limiter) = &mut self.rate_limiter {
+                            rate_limiter.event_handler().map_err(|e| {
+                                EpollHelperError::HandleEvent(anyhow!(
+                                    "Failed to process rate limiter event while quiescing: {e:?}"
+                                ))
+                            })?;
+                        } else {
+                            return Err(EpollHelperError::HandleEvent(anyhow!(
+                                "Unexpected rate limiter event while quiescing"
+                            )));
+                        }
+                    }
+                    EPOLL_HELPER_EVENT_KILL => {
+                        return Err(EpollHelperError::HandleEvent(anyhow!(
+                            "Kill event received while quiescing block queue {}",
+                            self.queue_index
+                        )));
+                    }
+                    ev_type => {
+                        return Err(EpollHelperError::HandleEvent(anyhow!(
+                            "Unexpected event while quiescing: {ev_type}"
+                        )));
+                    }
                 }
-                return Err(EpollHelperError::IoError(e));
             }
         }
 
@@ -1631,7 +1656,14 @@ mod tests {
     }
 
     fn test_epoll_helper(handler: &BlockEpollHandler) -> EpollHelper {
-        EpollHelper::new(&handler.kill_evt, &handler.pause_evt).unwrap()
+        let mut helper = EpollHelper::new(&handler.kill_evt, &handler.pause_evt).unwrap();
+        helper
+            .add_event(handler.queue_evt.as_raw_fd(), QUEUE_AVAIL_EVENT)
+            .unwrap();
+        helper
+            .add_event(handler.disk_image.notifier().as_raw_fd(), COMPLETION_EVENT)
+            .unwrap();
+        helper
     }
 
     #[test]

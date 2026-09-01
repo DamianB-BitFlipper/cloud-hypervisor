@@ -628,6 +628,10 @@ fn vmm_thread_rules(
         (libc::SYS_exit_group, vec![]),
         (libc::SYS_fallocate, vec![]),
         (libc::SYS_fcntl, vec![]),
+        (
+            libc::SYS_fchmod,
+            or![and![Cond::new(1, ArgLen::Dword, Eq, 0o660)?]],
+        ),
         (libc::SYS_fdatasync, vec![]),
         (libc::SYS_fstat, vec![]),
         (libc::SYS_fsync, vec![]),
