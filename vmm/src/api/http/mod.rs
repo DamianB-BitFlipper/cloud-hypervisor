@@ -29,9 +29,11 @@ use self::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmmPing, VmmShutdow
 use crate::api::VmCoredump;
 use crate::api::{
     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet,
-    VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmNmi,
-    VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
-    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+    VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete,
+    VmIncrementalSnapshotAbort, VmIncrementalSnapshotAbortActive, VmIncrementalSnapshotBegin,
+    VmIncrementalSnapshotCommit, VmIncrementalSnapshotFinalize, VmNmi, VmPause, VmPowerButton,
+    VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore,
+    VmResume, VmSendMigration, VmShutdown, VmSnapshot,
 };
 use crate::landlock::Landlock;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
@@ -282,6 +284,26 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
     r.routes.insert(
         endpoint!("/vm.snapshot"),
         Box::new(VmActionHandler::new(&VmSnapshot)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.snapshot-incremental.begin"),
+        Box::new(VmActionHandler::new(&VmIncrementalSnapshotBegin)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.snapshot-incremental.finalize"),
+        Box::new(VmActionHandler::new(&VmIncrementalSnapshotFinalize)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.snapshot-incremental.commit"),
+        Box::new(VmActionHandler::new(&VmIncrementalSnapshotCommit)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.snapshot-incremental.abort"),
+        Box::new(VmActionHandler::new(&VmIncrementalSnapshotAbort)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.snapshot-incremental.abort-active"),
+        Box::new(VmActionHandler::new(&VmIncrementalSnapshotAbortActive)),
     );
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     r.routes.insert(

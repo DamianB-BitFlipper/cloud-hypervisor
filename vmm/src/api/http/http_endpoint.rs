@@ -47,9 +47,10 @@ use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, NetConfig, VmAddDevice, VmAddFs,
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
-    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
-    VmShutdown, VmSnapshot,
+    VmConfig, VmCounters, VmDelete, VmIncrementalSnapshotAbort, VmIncrementalSnapshotAbortActive,
+    VmIncrementalSnapshotBegin, VmIncrementalSnapshotCommit, VmIncrementalSnapshotFinalize, VmNmi,
+    VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
+    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -416,6 +417,7 @@ vm_action_put_handler!(VmPause);
 vm_action_put_handler!(VmResume);
 vm_action_put_handler!(VmPowerButton);
 vm_action_put_handler!(VmNmi);
+vm_action_put_handler!(VmIncrementalSnapshotAbortActive);
 
 vm_action_put_handler_body!(VmAddDevice);
 vm_action_put_handler_body!(AddDisk);
@@ -429,6 +431,10 @@ vm_action_put_handler_body!(VmRemoveDevice);
 vm_action_put_handler_body!(VmResizeDisk);
 vm_action_put_handler_body!(VmResizeZone);
 vm_action_put_handler_body!(VmSnapshot);
+vm_action_put_handler_body!(VmIncrementalSnapshotBegin);
+vm_action_put_handler_body!(VmIncrementalSnapshotFinalize);
+vm_action_put_handler_body!(VmIncrementalSnapshotCommit);
+vm_action_put_handler_body!(VmIncrementalSnapshotAbort);
 vm_action_put_handler_body!(VmReceiveMigration);
 vm_action_put_handler_body!(VmSendMigration);
 

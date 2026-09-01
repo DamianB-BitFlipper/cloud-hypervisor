@@ -48,12 +48,16 @@ use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
-    ApiRequest, ApiResponse, RequestHandler, TimeoutStrategy, VmInfoResponse,
-    VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    ApiRequest, ApiResponse, RequestHandler, TimeoutStrategy, VmIncrementalSnapshotBeginConfig,
+    VmIncrementalSnapshotId, VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData,
+    VmmPingResponse,
 };
 use crate::config::{MemoryRestoreMode, RestoreConfig, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
+use crate::incremental_snapshot::{
+    CapturePhase, CompatibilityDescriptor, IncrementalSnapshotCapture,
+};
 use crate::landlock::Landlock;
 use crate::memory_manager::MemoryManager;
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -83,6 +87,7 @@ pub mod device_tree;
 mod gdb;
 #[cfg(feature = "igvm")]
 mod igvm;
+mod incremental_snapshot;
 pub mod interrupt;
 pub mod landlock;
 pub mod memory_manager;
@@ -634,6 +639,16 @@ pub struct Vmm {
     console_resize_pipe: Option<Arc<File>>,
     console_info: Option<ConsoleInfo>,
     no_shutdown: bool,
+    incremental_snapshot: Option<IncrementalSnapshotCapture>,
+    incremental_snapshot_carryover: MemoryRangeTable,
+    next_incremental_snapshot_id: u64,
+    last_incremental_snapshot_completion: Option<(u64, IncrementalSnapshotCompletion)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncrementalSnapshotCompletion {
+    Committed,
+    Aborted,
 }
 
 /// Just a wrapper for the data that goes into
@@ -842,6 +857,10 @@ impl Vmm {
             console_resize_pipe: None,
             console_info: None,
             no_shutdown,
+            incremental_snapshot: None,
+            incremental_snapshot_carryover: MemoryRangeTable::default(),
+            next_incremental_snapshot_id: 1,
+            last_incremental_snapshot_completion: None,
         })
     }
 
@@ -1169,6 +1188,11 @@ impl Vmm {
             // Create VM
             vm.restore().map_err(|e| {
                 MigratableError::MigrateReceive(anyhow!("Failed restoring the Vm: {e}"))
+            })?;
+            vm.start_incremental_dirty_tracking().map_err(|e| {
+                MigratableError::MigrateReceive(anyhow!(
+                    "Failed starting incremental dirty tracking after restore: {e}"
+                ))
             })?;
 
             Ok(vm)
@@ -1639,7 +1663,9 @@ impl Vmm {
 
         // Now we can restore the rest of the VM.
         if let Some(ref mut vm) = self.vm {
-            vm.restore()
+            vm.restore()?;
+            vm.start_incremental_dirty_tracking()
+                .map_err(VmError::IncrementalSnapshot)
         } else {
             Err(VmError::VmNotCreated)
         }
@@ -1768,6 +1794,165 @@ fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError>
     Ok(())
 }
 
+fn incremental_snapshot_error(message: impl Into<String>) -> VmError {
+    VmError::IncrementalSnapshot(MigratableError::MigrateSend(anyhow!(message.into())))
+}
+
+fn validate_incremental_snapshot_begin(
+    vm: &Vm,
+    config: &VmIncrementalSnapshotBeginConfig,
+    version: &VmmVersionInfo,
+) -> result::Result<CompatibilityDescriptor, VmError> {
+    if vm.get_state() != VmState::Running {
+        return Err(incremental_snapshot_error(format!(
+            "incremental snapshot begin requires a running VM, current state is {:?}",
+            vm.get_state()
+        )));
+    }
+    if !(1..=64).contains(&config.max_iterations) {
+        return Err(incremental_snapshot_error(
+            "max_iterations must be between 1 and 64",
+        ));
+    }
+    if config.target_dirty_bytes == 0 {
+        return Err(incremental_snapshot_error(
+            "target_dirty_bytes must be non-zero",
+        ));
+    }
+
+    let vm_config = vm.get_config();
+    let vm_config = vm_config.lock().unwrap();
+
+    #[cfg(feature = "tdx")]
+    if vm_config.is_tdx_enabled() {
+        return Err(incremental_snapshot_error(
+            "incremental snapshots are not supported for TDX VMs",
+        ));
+    }
+    #[cfg(feature = "sev_snp")]
+    if vm_config.is_sev_snp_enabled() {
+        return Err(incremental_snapshot_error(
+            "incremental snapshots are not supported for SEV-SNP VMs",
+        ));
+    }
+
+    if vm_config
+        .devices
+        .as_ref()
+        .is_some_and(|devices| !devices.is_empty())
+        || vm_config
+            .user_devices
+            .as_ref()
+            .is_some_and(|devices| !devices.is_empty())
+        || vm_config
+            .vdpa
+            .as_ref()
+            .is_some_and(|devices| !devices.is_empty())
+    {
+        return Err(incremental_snapshot_error(
+            "incremental snapshots do not support VFIO, vfio-user, or vDPA devices",
+        ));
+    }
+
+    let has_vhost_user_disk = vm_config
+        .disks
+        .as_ref()
+        .is_some_and(|disks| disks.iter().any(|disk| disk.vhost_user));
+    let has_vhost_user_net = vm_config
+        .net
+        .as_ref()
+        .is_some_and(|nets| nets.iter().any(|net| net.vhost_user));
+    if has_vhost_user_disk
+        || has_vhost_user_net
+        || vm_config
+            .fs
+            .as_ref()
+            .is_some_and(|devices| !devices.is_empty())
+        || vm_config
+            .generic_vhost_user
+            .as_ref()
+            .is_some_and(|devices| !devices.is_empty())
+    {
+        return Err(incremental_snapshot_error(
+            "incremental snapshots do not yet support vhost-user memory writers",
+        ));
+    }
+
+    let has_hotplugged_memory = vm_config.memory.hotplugged_size.unwrap_or(0) != 0
+        || vm_config.memory.zones.as_ref().is_some_and(|zones| {
+            zones
+                .iter()
+                .any(|zone| zone.hotplugged_size.unwrap_or(0) != 0)
+        });
+    if has_hotplugged_memory {
+        return Err(incremental_snapshot_error(
+            "incremental snapshots do not yet support memory hotplug",
+        ));
+    }
+
+    Ok(CompatibilityDescriptor::new(
+        &vm_config,
+        &version.version,
+        &version.build_version,
+    ))
+}
+
+fn commit_incremental_snapshot_capture(
+    active_capture: &mut Option<IncrementalSnapshotCapture>,
+    last_completion: &mut Option<(u64, IncrementalSnapshotCompletion)>,
+    capture_id: u64,
+) -> result::Result<(), VmError> {
+    if *last_completion == Some((capture_id, IncrementalSnapshotCompletion::Committed)) {
+        return Ok(());
+    }
+
+    let capture = active_capture.as_ref().ok_or_else(|| {
+        incremental_snapshot_error(format!("incremental capture {capture_id} does not exist"))
+    })?;
+    if capture.id() != capture_id {
+        return Err(incremental_snapshot_error(format!(
+            "capture ID mismatch: active capture is {}, requested {capture_id}",
+            capture.id()
+        )));
+    }
+    if capture.phase() != CapturePhase::Finalized {
+        return Err(incremental_snapshot_error(format!(
+            "capture {capture_id} must be finalized before commit; current phase is {:?}",
+            capture.phase()
+        )));
+    }
+
+    active_capture.take();
+    *last_completion = Some((capture_id, IncrementalSnapshotCompletion::Committed));
+    Ok(())
+}
+
+fn abort_incremental_snapshot_capture(
+    active_capture: &mut Option<IncrementalSnapshotCapture>,
+    carryover: &mut MemoryRangeTable,
+    last_completion: &mut Option<(u64, IncrementalSnapshotCompletion)>,
+    capture_id: u64,
+) -> result::Result<(), VmError> {
+    if *last_completion == Some((capture_id, IncrementalSnapshotCompletion::Aborted)) {
+        return Ok(());
+    }
+
+    let capture = active_capture.as_ref().ok_or_else(|| {
+        incremental_snapshot_error(format!("incremental capture {capture_id} does not exist"))
+    })?;
+    if capture.id() != capture_id {
+        return Err(incremental_snapshot_error(format!(
+            "capture ID mismatch: active capture is {}, requested {capture_id}",
+            capture.id()
+        )));
+    }
+
+    let capture = active_capture.take().unwrap();
+    carryover.extend(capture.captured_ranges().clone());
+    *last_completion = Some((capture_id, IncrementalSnapshotCompletion::Aborted));
+    Ok(())
+}
+
 impl RequestHandler for Vmm {
     fn vm_create(&mut self, config: Box<VmConfig>) -> result::Result<(), VmError> {
         // We only store the passed VM config.
@@ -1800,6 +1985,18 @@ impl RequestHandler for Vmm {
             // If we don't have a config, we cannot boot a VM.
             if self.vm_config.is_none() {
                 return Err(VmError::VmMissingConfig);
+            }
+
+            if self.vm.is_none() {
+                if let Some(capture) = &self.incremental_snapshot {
+                    return Err(incremental_snapshot_error(format!(
+                        "capture {} must be committed or aborted before booting a new VM",
+                        capture.id()
+                    )));
+                }
+                // A newly allocated guest memory image starts a new root
+                // generation. Dirty addresses from an older image are invalid.
+                self.incremental_snapshot_carryover = MemoryRangeTable::default();
             }
 
             // console_info is set to None in vm_shutdown. re-populate here if empty
@@ -1881,6 +2078,12 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+        if self.incremental_snapshot.is_some() {
+            return Err(incremental_snapshot_error(
+                "a full snapshot cannot run while an incremental capture is active",
+            ));
+        }
+
         if let Some(ref mut vm) = self.vm {
             // Drain console_info so that FDs are not reused
             let _ = self.console_info.take();
@@ -1893,6 +2096,220 @@ impl RequestHandler for Vmm {
         } else {
             Err(VmError::VmNotRunning)
         }
+    }
+
+    fn vm_incremental_snapshot_begin(
+        &mut self,
+        config: VmIncrementalSnapshotBeginConfig,
+    ) -> result::Result<Option<Vec<u8>>, VmError> {
+        if let Some(capture) = &self.incremental_snapshot {
+            return Err(incremental_snapshot_error(format!(
+                "incremental capture {} is already active",
+                capture.id()
+            )));
+        }
+
+        let vm = self.vm.as_ref().ok_or(VmError::VmNotRunning)?;
+        let compatibility = validate_incremental_snapshot_begin(vm, &config, &self.version)?;
+
+        let capture_id = self.next_incremental_snapshot_id;
+        self.next_incremental_snapshot_id = self
+            .next_incremental_snapshot_id
+            .checked_add(1)
+            .ok_or_else(|| incremental_snapshot_error("incremental capture ID overflow"))?;
+
+        let mut capture =
+            IncrementalSnapshotCapture::new(capture_id, config.destination_url.clone())
+                .map_err(VmError::IncrementalSnapshot)?;
+        capture
+            .write_compatibility(&compatibility)
+            .map_err(VmError::IncrementalSnapshot)?;
+
+        let vm = self.vm.as_mut().ok_or(VmError::VmNotRunning)?;
+        let guest_memory = vm.guest_memory();
+        // dirty_log() clears slot bitmaps as it reads them. Capture the full
+        // layout first so a later slot error can conservatively carry every
+        // guest page into the next generation.
+        let all_memory = vm
+            .memory_range_table()
+            .map_err(VmError::IncrementalSnapshot)?;
+        let mut previous_generation = std::mem::take(&mut self.incremental_snapshot_carryover);
+
+        let precopy_result = (|| -> result::Result<(), MigratableError> {
+            for iteration in 0..config.max_iterations {
+                let mut ranges = vm.incremental_dirty_log()?;
+                if iteration == 0 {
+                    ranges.extend(std::mem::take(&mut previous_generation));
+                }
+
+                let dirty_bytes = ranges.effective_size();
+                capture.append_memory(&guest_memory, ranges)?;
+
+                debug!(
+                    "Incremental snapshot capture {capture_id} pre-copy iteration {iteration}: {dirty_bytes} bytes"
+                );
+                if dirty_bytes <= config.target_dirty_bytes {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = precopy_result {
+            self.incremental_snapshot_carryover.extend(all_memory);
+            return Err(VmError::IncrementalSnapshot(error));
+        }
+
+        self.incremental_snapshot = Some(capture);
+        let response = serde_json::to_vec(&VmIncrementalSnapshotId { capture_id })
+            .map_err(VmError::SerializeJson)?;
+        event!(
+            "vm",
+            "incremental-snapshot-begun",
+            "capture_id",
+            capture_id.to_string()
+        );
+        Ok(Some(response))
+    }
+
+    fn vm_incremental_snapshot_finalize(
+        &mut self,
+        data: VmIncrementalSnapshotId,
+    ) -> result::Result<(), VmError> {
+        let mut capture = self.incremental_snapshot.take().ok_or_else(|| {
+            incremental_snapshot_error(format!(
+                "incremental capture {} does not exist",
+                data.capture_id
+            ))
+        })?;
+
+        if capture.id() != data.capture_id {
+            let active_id = capture.id();
+            self.incremental_snapshot = Some(capture);
+            return Err(incremental_snapshot_error(format!(
+                "capture ID mismatch: active capture is {active_id}, requested {}",
+                data.capture_id
+            )));
+        }
+        if capture.phase() != CapturePhase::Capturing {
+            let phase = capture.phase();
+            self.incremental_snapshot = Some(capture);
+            return Err(incremental_snapshot_error(format!(
+                "capture {} cannot be finalized from phase {phase:?}",
+                data.capture_id
+            )));
+        }
+
+        let vm = match self.vm.as_mut() {
+            Some(vm) => vm,
+            None => {
+                self.incremental_snapshot = Some(capture);
+                return Err(VmError::VmNotRunning);
+            }
+        };
+        if vm.get_state() != VmState::Paused {
+            let state = vm.get_state();
+            self.incremental_snapshot = Some(capture);
+            return Err(incremental_snapshot_error(format!(
+                "incremental snapshot finalize requires a paused VM, current state is {state:?}"
+            )));
+        }
+
+        // dirty_log() clears slot bitmaps incrementally. Keep a full-memory
+        // fallback ready before collection so any slot error cannot lose pages.
+        let all_memory = match vm.memory_range_table() {
+            Ok(all_memory) => all_memory,
+            Err(error) => {
+                self.incremental_snapshot = Some(capture);
+                return Err(VmError::IncrementalSnapshot(error));
+            }
+        };
+
+        let finalize_result = (|| -> result::Result<(), MigratableError> {
+            let final_ranges = vm.incremental_dirty_log()?;
+            capture.append_memory(&vm.guest_memory(), final_ranges)?;
+
+            let snapshot = vm.snapshot()?;
+            vm.send_snapshot_state(&snapshot, capture.destination_url())?;
+            capture.set_restore_layout(vm.snapshot_memory_range_table()?)?;
+            capture.finalize()
+        })();
+
+        if let Err(error) = finalize_result {
+            self.incremental_snapshot_carryover.extend(all_memory);
+            capture.mark_failed();
+            self.incremental_snapshot = Some(capture);
+            return Err(VmError::IncrementalSnapshot(error));
+        }
+
+        self.incremental_snapshot = Some(capture);
+        event!(
+            "vm",
+            "incremental-snapshot-finalized",
+            "capture_id",
+            data.capture_id.to_string()
+        );
+        Ok(())
+    }
+
+    fn vm_incremental_snapshot_commit(
+        &mut self,
+        data: VmIncrementalSnapshotId,
+    ) -> result::Result<(), VmError> {
+        commit_incremental_snapshot_capture(
+            &mut self.incremental_snapshot,
+            &mut self.last_incremental_snapshot_completion,
+            data.capture_id,
+        )?;
+        event!(
+            "vm",
+            "incremental-snapshot-committed",
+            "capture_id",
+            data.capture_id.to_string()
+        );
+        Ok(())
+    }
+
+    fn vm_incremental_snapshot_abort(
+        &mut self,
+        data: VmIncrementalSnapshotId,
+    ) -> result::Result<(), VmError> {
+        abort_incremental_snapshot_capture(
+            &mut self.incremental_snapshot,
+            &mut self.incremental_snapshot_carryover,
+            &mut self.last_incremental_snapshot_completion,
+            data.capture_id,
+        )?;
+        event!(
+            "vm",
+            "incremental-snapshot-aborted",
+            "capture_id",
+            data.capture_id.to_string()
+        );
+        Ok(())
+    }
+
+    fn vm_incremental_snapshot_abort_active(&mut self) -> result::Result<(), VmError> {
+        let Some(capture_id) = self
+            .incremental_snapshot
+            .as_ref()
+            .map(|capture| capture.id())
+        else {
+            return Ok(());
+        };
+        abort_incremental_snapshot_capture(
+            &mut self.incremental_snapshot,
+            &mut self.incremental_snapshot_carryover,
+            &mut self.last_incremental_snapshot_completion,
+            capture_id,
+        )?;
+        event!(
+            "vm",
+            "incremental-snapshot-aborted",
+            "capture_id",
+            capture_id.to_string()
+        );
+        Ok(())
     }
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
@@ -1980,6 +2397,14 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_reboot(&mut self) -> result::Result<(), VmError> {
+        if let Some(capture) = &self.incremental_snapshot {
+            return Err(incremental_snapshot_error(format!(
+                "capture {} must be committed or aborted before reboot",
+                capture.id()
+            )));
+        }
+        self.incremental_snapshot_carryover = MemoryRangeTable::default();
+
         event!("vm", "rebooting");
 
         // First we stop the current VM
@@ -2108,6 +2533,9 @@ impl RequestHandler for Vmm {
         }
 
         self.vm_config = None;
+        self.incremental_snapshot = None;
+        self.incremental_snapshot_carryover = MemoryRangeTable::default();
+        self.last_incremental_snapshot_completion = None;
 
         event!("vm", "deleted");
 
@@ -2534,6 +2962,13 @@ impl RequestHandler for Vmm {
         &mut self,
         send_data_migration: VmSendMigrationData,
     ) -> result::Result<(), MigratableError> {
+        if let Some(capture) = &self.incremental_snapshot {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "incremental capture {} must be committed or aborted before migration",
+                capture.id()
+            )));
+        }
+
         send_data_migration
             .validate()
             .context("Invalid send migration configuration")
@@ -2578,13 +3013,14 @@ impl RequestHandler for Vmm {
         }
 
         event!("vm", "migration-started");
-        Self::send_migration(
+        let migration_result = Self::send_migration(
             vm,
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             self.hypervisor.as_ref(),
             &send_data_migration,
-        )
-        .map_err(|migration_err| {
+        );
+
+        if let Err(migration_err) = migration_result {
             error!("Migration failed: {migration_err:?}");
             event!("vm", "migration-failed");
 
@@ -2592,17 +3028,23 @@ impl RequestHandler for Vmm {
             if !send_data_migration.local
                 && let Err(e) = vm.stop_dirty_log()
             {
-                return e;
+                return Err(e);
             }
 
             if vm.get_state() == VmState::Paused
                 && let Err(e) = vm.resume()
             {
-                return e;
+                return Err(e);
             }
 
-            migration_err
-        })?;
+            // Migration iterations clear dirty bits. If migration fails, make
+            // the next incremental capture conservatively include all RAM,
+            // then restart persistent tracking before returning control.
+            let all_memory = vm.memory_range_table()?;
+            vm.start_incremental_dirty_tracking()?;
+            self.incremental_snapshot_carryover.extend(all_memory);
+            return Err(migration_err);
+        }
 
         event!("vm", "migration-finished");
 
@@ -2630,6 +3072,7 @@ mod unit_tests {
         ConsoleConfig, ConsoleOutputMode, CoreScheduling, CpuFeatures, CpusConfig, HotplugMethod,
         MemoryConfig, PayloadConfig, RngConfig,
     };
+    use vmm_sys_util::tempdir::TempDir;
 
     fn create_dummy_vmm() -> Vmm {
         Vmm::new(
@@ -2732,6 +3175,62 @@ mod unit_tests {
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
         })
+    }
+
+    #[test]
+    fn test_incremental_snapshot_commit_and_abort_are_idempotent() {
+        let mut carryover = MemoryRangeTable::default();
+        let mut last_completion = None;
+
+        let commit_dir = TempDir::new().unwrap();
+        let commit_url = format!("file://{}", commit_dir.as_path().display());
+        let mut commit_capture = IncrementalSnapshotCapture::new(1, commit_url).unwrap();
+        commit_capture.finalize().unwrap();
+        let mut active_capture = Some(commit_capture);
+
+        assert!(
+            commit_incremental_snapshot_capture(&mut active_capture, &mut last_completion, 1)
+                .is_ok()
+        );
+        assert!(
+            commit_incremental_snapshot_capture(&mut active_capture, &mut last_completion, 1)
+                .is_ok()
+        );
+        assert!(active_capture.is_none());
+
+        let abort_dir = TempDir::new().unwrap();
+        let abort_url = format!("file://{}", abort_dir.as_path().display());
+        let mut abort_capture = IncrementalSnapshotCapture::new(2, abort_url).unwrap();
+        let memory = GuestMemoryAtomic::new(
+            GuestMemoryMmap::from_ranges(&[(vm_memory::GuestAddress(0), 0x1000)]).unwrap(),
+        );
+        let mut ranges = MemoryRangeTable::default();
+        ranges.push(MemoryRange {
+            gpa: 0,
+            length: 0x1000,
+        });
+        abort_capture.append_memory(&memory, ranges).unwrap();
+        active_capture = Some(abort_capture);
+
+        assert!(
+            abort_incremental_snapshot_capture(
+                &mut active_capture,
+                &mut carryover,
+                &mut last_completion,
+                2,
+            )
+            .is_ok()
+        );
+        assert!(
+            abort_incremental_snapshot_capture(
+                &mut active_capture,
+                &mut carryover,
+                &mut last_completion,
+                2,
+            )
+            .is_ok()
+        );
+        assert_eq!(carryover.effective_size(), 0x1000);
     }
 
     #[test]

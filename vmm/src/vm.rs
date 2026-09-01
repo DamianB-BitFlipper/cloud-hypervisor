@@ -18,6 +18,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::num::Wrapping;
 use std::ops::Deref;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
@@ -224,6 +225,9 @@ pub enum Error {
 
     #[error("Cannot send VM snapshot")]
     SnapshotSend(#[source] MigratableError),
+
+    #[error("Cannot manage incremental VM snapshots")]
+    IncrementalSnapshot(#[source] MigratableError),
 
     #[error("Invalid restore source URL")]
     InvalidRestoreSourceUrl,
@@ -910,6 +914,18 @@ impl Vm {
             .allocate_address_space()
             .map_err(Error::MemoryManager)?;
 
+        // Incremental snapshots use a persistent dirty generation. Start it
+        // after all boot RAM slots exist but before firmware, the kernel,
+        // initramfs, ACPI tables, or vCPUs can write guest memory.
+        if snapshot.is_none() && Self::incremental_dirty_tracking_supported(&config.lock().unwrap())
+        {
+            memory_manager
+                .lock()
+                .unwrap()
+                .start_dirty_log()
+                .map_err(Error::IncrementalSnapshot)?;
+        }
+
         // Load payload asynchronously
         let load_payload_handle = if snapshot.is_none() {
             Self::load_payload_async(
@@ -948,6 +964,20 @@ impl Vm {
         Self::create_fw_cfg_if_enabled(config, device_manager)?;
 
         Ok(load_payload_handle)
+    }
+
+    fn incremental_dirty_tracking_supported(_config: &VmConfig) -> bool {
+        #[cfg(feature = "tdx")]
+        if _config.is_tdx_enabled() {
+            return false;
+        }
+
+        #[cfg(feature = "sev_snp")]
+        if _config.is_sev_snp_enabled() {
+            return false;
+        }
+
+        true
     }
 
     /// Initialize SEV-SNP specific components.
@@ -2877,6 +2907,33 @@ impl Vm {
             .memory_range_table(false)
     }
 
+    /// Return the ordered memory layout used by the legacy snapshot file.
+    pub fn snapshot_memory_range_table(
+        &self,
+    ) -> std::result::Result<MemoryRangeTable, MigratableError> {
+        self.memory_manager.lock().unwrap().memory_range_table(true)
+    }
+
+    /// Reset and enable the persistent dirty generation after restoring a VM,
+    /// before it is allowed to resume.
+    pub fn start_incremental_dirty_tracking(&mut self) -> std::result::Result<(), MigratableError> {
+        if !Self::incremental_dirty_tracking_supported(&self.config.lock().unwrap()) {
+            return Ok(());
+        }
+
+        self.memory_manager.lock().unwrap().start_dirty_log()
+    }
+
+    /// Return and clear RAM pages dirtied in the current incremental
+    /// generation. Device-owned logging is deliberately excluded; configs
+    /// whose DMA cannot be observed through the guest-memory bitmap are
+    /// rejected by the incremental snapshot API.
+    pub fn incremental_dirty_log(
+        &mut self,
+    ) -> std::result::Result<MemoryRangeTable, MigratableError> {
+        self.memory_manager.lock().unwrap().dirty_log()
+    }
+
     pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
         self.memory_manager.lock().unwrap().guest_memory()
     }
@@ -3219,6 +3276,32 @@ impl Transportable for Vm {
         snapshot: &Snapshot,
         destination_url: &str,
     ) -> std::result::Result<(), MigratableError> {
+        self.send_snapshot_state(snapshot, destination_url)?;
+
+        // Tell the memory manager to also send/write its own snapshot.
+        if let Some(memory_manager_snapshot) = snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {
+            self.memory_manager
+                .lock()
+                .unwrap()
+                .send(&memory_manager_snapshot.clone(), destination_url)?;
+        } else {
+            return Err(MigratableError::Restore(anyhow!(
+                "Missing memory manager snapshot"
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+impl Vm {
+    /// Write config and device/vCPU state without writing a full RAM image.
+    /// Incremental snapshotting stores RAM through its delta writer instead.
+    pub fn send_snapshot_state(
+        &self,
+        snapshot: &Snapshot,
+        destination_url: &str,
+    ) -> std::result::Result<(), MigratableError> {
         let mut snapshot_config_path = url_to_path(destination_url)?;
         snapshot_config_path.push(SNAPSHOT_CONFIG_FILE);
 
@@ -3227,7 +3310,10 @@ impl Transportable for Vm {
             .read(true)
             .write(true)
             .create_new(true)
-            .open(snapshot_config_path)
+            .open(&snapshot_config_path)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        snapshot_config_file
+            .set_permissions(std::fs::Permissions::from_mode(0o660))
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         // Serialize and write the snapshot config
@@ -3246,7 +3332,10 @@ impl Transportable for Vm {
             .read(true)
             .write(true)
             .create_new(true)
-            .open(snapshot_state_path)
+            .open(&snapshot_state_path)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        snapshot_state_file
+            .set_permissions(std::fs::Permissions::from_mode(0o660))
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         // Serialize and write the snapshot state
@@ -3256,18 +3345,6 @@ impl Transportable for Vm {
         snapshot_state_file
             .write(&vm_state)
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-        // Tell the memory manager to also send/write its own snapshot.
-        if let Some(memory_manager_snapshot) = snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {
-            self.memory_manager
-                .lock()
-                .unwrap()
-                .send(&memory_manager_snapshot.clone(), destination_url)?;
-        } else {
-            return Err(MigratableError::Restore(anyhow!(
-                "Missing memory manager snapshot"
-            )));
-        }
 
         Ok(())
     }

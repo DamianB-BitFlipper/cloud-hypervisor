@@ -427,6 +427,90 @@ paths:
         405:
           description: The VM instance could not be snapshotted because it is not booted.
 
+  /vm.snapshot-incremental.begin:
+    put:
+      summary: Begin an incremental VM snapshot and pre-copy dirty RAM while running.
+      requestBody:
+        description: Incremental snapshot pre-copy configuration
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VmIncrementalSnapshotBeginConfig"
+        required: true
+      responses:
+        200:
+          description: Incremental capture was created and pre-copy completed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmIncrementalSnapshotId"
+        400:
+          description: The incremental capture request body was invalid.
+        500:
+          description: The incremental capture could not be started.
+
+  /vm.snapshot-incremental.finalize:
+    put:
+      summary: Finalize incremental RAM and VM state while the VM is paused.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VmIncrementalSnapshotId"
+        required: true
+      responses:
+        204:
+          description: The incremental capture was finalized.
+        400:
+          description: The incremental finalize request body was invalid.
+        500:
+          description: The incremental capture could not be finalized.
+
+  /vm.snapshot-incremental.commit:
+    put:
+      summary: Commit a finalized incremental capture as the generation boundary.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VmIncrementalSnapshotId"
+        required: true
+      responses:
+        204:
+          description: The incremental capture was committed.
+        400:
+          description: The incremental commit request body was invalid.
+        500:
+          description: The incremental capture could not be committed.
+
+  /vm.snapshot-incremental.abort:
+    put:
+      summary: Abort a capture and retain its dirty addresses for the next generation.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VmIncrementalSnapshotId"
+        required: true
+      responses:
+        204:
+          description: The incremental capture was aborted.
+        400:
+          description: The incremental abort request body was invalid.
+        500:
+          description: The incremental capture could not be aborted.
+
+  /vm.snapshot-incremental.abort-active:
+    put:
+      summary: Abort any active incremental capture after its ID was lost.
+      responses:
+        204:
+          description: The active capture was aborted, or no capture was active.
+        400:
+          description: The request included an unexpected body.
+        500:
+          description: The active incremental capture could not be aborted.
+
   /vm.coredump:
     put:
       summary: Takes a VM coredump.
@@ -1373,6 +1457,37 @@ components:
       properties:
         destination_url:
           type: string
+
+    VmIncrementalSnapshotBeginConfig:
+      type: object
+      required:
+        - destination_url
+      properties:
+        destination_url:
+          description: Local directory URL using the file scheme.
+          type: string
+        max_iterations:
+          description: Maximum running-VM pre-copy passes.
+          type: integer
+          format: uint32
+          default: 3
+          minimum: 1
+          maximum: 64
+        target_dirty_bytes:
+          description: Stop pre-copy after a pass no larger than this value.
+          type: integer
+          format: uint64
+          default: 16777216
+          minimum: 1
+
+    VmIncrementalSnapshotId:
+      type: object
+      required:
+        - capture_id
+      properties:
+        capture_id:
+          type: integer
+          format: uint64
 
     VmCoredumpData:
       type: object

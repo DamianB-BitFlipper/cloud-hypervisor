@@ -123,6 +123,10 @@ pub enum ApiError {
     #[error("The VM could not be snapshotted")]
     VmSnapshot(#[source] VmError),
 
+    /// An incremental VM snapshot operation failed.
+    #[error("The incremental VM snapshot operation failed")]
+    VmIncrementalSnapshot(#[source] VmError),
+
     /// The VM could not be restored.
     #[error("The VM could not be restored")]
     VmRestore(#[source] VmError),
@@ -257,6 +261,33 @@ pub struct VmRemoveDeviceData {
 pub struct VmSnapshotConfig {
     /// The snapshot destination URL
     pub destination_url: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct VmIncrementalSnapshotBeginConfig {
+    /// Local directory URL (`file://...`) for the incremental snapshot files.
+    pub destination_url: String,
+    /// Maximum number of running-VM pre-copy passes.
+    #[serde(default = "VmIncrementalSnapshotBeginConfig::default_max_iterations")]
+    pub max_iterations: u32,
+    /// Stop pre-copy after a pass at or below this many bytes.
+    #[serde(default = "VmIncrementalSnapshotBeginConfig::default_target_dirty_bytes")]
+    pub target_dirty_bytes: u64,
+}
+
+impl VmIncrementalSnapshotBeginConfig {
+    fn default_max_iterations() -> u32 {
+        3
+    }
+
+    fn default_target_dirty_bytes() -> u64 {
+        16 << 20
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+pub struct VmIncrementalSnapshotId {
+    pub capture_id: u64,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -514,6 +545,28 @@ pub trait RequestHandler {
     fn vm_resume(&mut self) -> Result<(), VmError>;
 
     fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
+
+    fn vm_incremental_snapshot_begin(
+        &mut self,
+        config: VmIncrementalSnapshotBeginConfig,
+    ) -> Result<Option<Vec<u8>>, VmError>;
+
+    fn vm_incremental_snapshot_finalize(
+        &mut self,
+        data: VmIncrementalSnapshotId,
+    ) -> Result<(), VmError>;
+
+    fn vm_incremental_snapshot_commit(
+        &mut self,
+        data: VmIncrementalSnapshotId,
+    ) -> Result<(), VmError>;
+
+    fn vm_incremental_snapshot_abort(
+        &mut self,
+        data: VmIncrementalSnapshotId,
+    ) -> Result<(), VmError>;
+
+    fn vm_incremental_snapshot_abort_active(&mut self) -> Result<(), VmError>;
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
 
@@ -1656,6 +1709,124 @@ impl ApiAction for VmSnapshot {
     }
 }
 
+pub struct VmIncrementalSnapshotBegin;
+
+impl ApiAction for VmIncrementalSnapshotBegin {
+    type RequestBody = VmIncrementalSnapshotBeginConfig;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        config: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmIncrementalSnapshotBegin {config:?}");
+
+            let response = vmm
+                .vm_incremental_snapshot_begin(config)
+                .map_err(ApiError::VmIncrementalSnapshot)
+                .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+macro_rules! incremental_snapshot_action {
+    ($action:ident, $method:ident) => {
+        pub struct $action;
+
+        impl ApiAction for $action {
+            type RequestBody = VmIncrementalSnapshotId;
+            type ResponseBody = Option<Body>;
+
+            fn request(
+                &self,
+                data: Self::RequestBody,
+                response_sender: Sender<ApiResponse>,
+            ) -> ApiRequest {
+                Box::new(move |vmm| {
+                    info!("API request event: {} {data:?}", stringify!($action));
+
+                    let response = vmm
+                        .$method(data)
+                        .map_err(ApiError::VmIncrementalSnapshot)
+                        .map(|_| ApiResponsePayload::Empty);
+
+                    response_sender
+                        .send(response)
+                        .map_err(VmmError::ApiResponseSend)?;
+
+                    Ok(false)
+                })
+            }
+
+            fn send(
+                &self,
+                api_evt: EventFd,
+                api_sender: Sender<ApiRequest>,
+                data: Self::RequestBody,
+            ) -> ApiResult<Self::ResponseBody> {
+                get_response_body(self, api_evt, api_sender, data)
+            }
+        }
+    };
+}
+
+incremental_snapshot_action!(
+    VmIncrementalSnapshotFinalize,
+    vm_incremental_snapshot_finalize
+);
+incremental_snapshot_action!(VmIncrementalSnapshotCommit, vm_incremental_snapshot_commit);
+incremental_snapshot_action!(VmIncrementalSnapshotAbort, vm_incremental_snapshot_abort);
+
+pub struct VmIncrementalSnapshotAbortActive;
+
+impl ApiAction for VmIncrementalSnapshotAbortActive {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmIncrementalSnapshotAbortActive");
+
+            let response = vmm
+                .vm_incremental_snapshot_abort_active()
+                .map_err(ApiError::VmIncrementalSnapshot)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
 pub struct VmmPing;
 
 impl ApiAction for VmmPing {
@@ -1757,6 +1928,19 @@ impl ApiAction for VmNmi {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[test]
+    fn test_incremental_snapshot_begin_defaults() {
+        let config: VmIncrementalSnapshotBeginConfig =
+            serde_json::from_str(r#"{"destination_url":"file:///tmp/capture"}"#).unwrap();
+
+        assert_eq!(config.destination_url, "file:///tmp/capture");
+        assert_eq!(config.max_iterations, 3);
+        assert_eq!(config.target_dirty_bytes, 16 << 20);
+
+        let id = VmIncrementalSnapshotId { capture_id: 42 };
+        assert_eq!(serde_json::to_string(&id).unwrap(), r#"{"capture_id":42}"#);
+    }
 
     #[test]
     fn test_vm_send_migration_data_parse() {
