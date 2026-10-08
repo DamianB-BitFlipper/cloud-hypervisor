@@ -379,6 +379,12 @@ fn get_cli_options_sorted(
             .num_args(0)
             .action(ArgAction::SetTrue)
             .group("vmm-config"),
+        Arg::new("no-reboot")
+            .long("no-reboot")
+            .help("Exit the VMM instead of rebooting when the guest resets")
+            .num_args(0)
+            .action(ArgAction::SetTrue)
+            .group("vmm-config"),
         Arg::new("numa")
             .long("numa")
             .help(NumaConfig::SYNTAX)
@@ -644,6 +650,7 @@ fn start_vmm(
     let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateExitEventFd)?;
     let landlock_enable = cmd_arguments.get_flag("landlock");
     let no_shutdown = cmd_arguments.get_flag("no-shutdown");
+    let no_reboot = cmd_arguments.get_flag("no-reboot");
 
     #[allow(unused_mut)]
     let mut event_monitor = cmd_arguments
@@ -741,6 +748,7 @@ fn start_vmm(
         &seccomp_action,
         hypervisor,
         no_shutdown,
+        no_reboot,
         landlock_enable,
     )
     .map_err(Error::StartVmmThread)?;

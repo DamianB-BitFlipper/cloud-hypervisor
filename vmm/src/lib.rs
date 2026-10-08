@@ -459,6 +459,7 @@ pub fn start_vmm_thread(
     seccomp_action: &SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     no_shutdown: bool,
+    no_reboot: bool,
     landlock_enable: bool,
 ) -> Result<VmmThreadHandle> {
     #[cfg(feature = "guest_debug")]
@@ -499,6 +500,7 @@ pub fn start_vmm_thread(
                     hypervisor,
                     exit_event,
                     no_shutdown,
+                    no_reboot,
                 )?;
 
                 vmm.setup_signal_handler(landlock_enable)?;
@@ -639,6 +641,7 @@ pub struct Vmm {
     console_resize_pipe: Option<Arc<File>>,
     console_info: Option<ConsoleInfo>,
     no_shutdown: bool,
+    no_reboot: bool,
     incremental_snapshot: Option<IncrementalSnapshotCapture>,
     incremental_snapshot_carryover: MemoryRangeTable,
     next_incremental_snapshot_id: u64,
@@ -804,6 +807,7 @@ impl Vmm {
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         exit_evt: EventFd,
         no_shutdown: bool,
+        no_reboot: bool,
     ) -> Result<Self> {
         let mut epoll = EpollContext::new().map_err(Error::Epoll)?;
         let reset_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
@@ -857,6 +861,7 @@ impl Vmm {
             console_resize_pipe: None,
             console_info: None,
             no_shutdown,
+            no_reboot,
             incremental_snapshot: None,
             incremental_snapshot_carryover: MemoryRangeTable::default(),
             next_incremental_snapshot_id: 1,
@@ -1718,6 +1723,15 @@ impl Vmm {
                         info!("VM reset event");
                         // Consume the event.
                         self.reset_evt.read().map_err(Error::EventFdRead)?;
+                        if self.no_reboot {
+                            // Treat any guest-initiated reset (panic, reboot(2), triple fault)
+                            // as the end of the VM instead of rebooting it in place.
+                            warn!("VM reset event with --no-reboot, exiting VMM");
+                            event!("vm", "reset-exit");
+                            self.vmm_shutdown().map_err(Error::VmmShutdown)?;
+
+                            break 'outer;
+                        }
                         self.vm_reboot().map_err(Error::VmReboot)?;
                     }
                     EpollDispatch::GuestExit => {
@@ -3085,6 +3099,7 @@ mod unit_tests {
             SeccompAction::Allow,
             hypervisor::new().unwrap(),
             EventFd::new(EFD_NONBLOCK).unwrap(),
+            false,
             false,
         )
         .unwrap()
