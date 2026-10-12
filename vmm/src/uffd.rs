@@ -153,6 +153,36 @@ pub(crate) fn copy(
 }
 
 #[repr(C)]
+struct UffdioZeropage {
+    range: UffdioRange,
+    mode: u64,
+    zeropage: i64,
+}
+
+/// Resolve a page fault by mapping the shared zero page at the faulted range.
+///
+/// Nothing is allocated until the guest writes to the page.
+pub(crate) fn zeropage(fd: BorrowedFd<'_>, dst: u64, len: u64) -> Result<(), std::io::Error> {
+    let mut zp = UffdioZeropage {
+        range: UffdioRange { start: dst, len },
+        mode: 0,
+        zeropage: 0,
+    };
+    // SAFETY: `zp` is a valid, correctly-sized struct for this ioctl.
+    let ret = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            userfaultfd::UFFDIO_ZEROPAGE as libc::Ioctl,
+            &mut zp,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[repr(C)]
 struct UffdioRange {
     start: u64,
     len: u64,

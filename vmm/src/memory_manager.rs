@@ -10,6 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Seek, SeekFrom};
 use std::ops::{BitAnd, Not, Sub};
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -69,6 +70,37 @@ struct UffdRange {
     length: u64,
     file_offset: u64,
     page_size: u64,
+    /// Whether the kernel supports `UFFDIO_ZEROPAGE` on this range (not hugetlbfs).
+    zeropage: bool,
+}
+
+/// Granularity at which snapshots skip all-zero guest memory, leaving file holes.
+const SNAPSHOT_SPARSE_PAGE_SIZE: usize = 4096;
+/// Guest memory is copied out in chunks of this size while writing a snapshot.
+const SNAPSHOT_WRITE_CHUNK_SIZE: usize = 2 << 20;
+
+/// Returns true when every byte of `buf` is zero.
+fn is_zero(buf: &[u8]) -> bool {
+    const ZEROES: [u8; SNAPSHOT_SPARSE_PAGE_SIZE] = [0; SNAPSHOT_SPARSE_PAGE_SIZE];
+    buf.chunks(ZEROES.len()).all(|c| c == &ZEROES[..c.len()])
+}
+
+/// Writes `data` at `offset`, skipping all-zero pages so they remain holes in a
+/// file that was pre-sized with `set_len`.
+fn write_nonzero_pages(file: &File, offset: u64, data: &[u8]) -> io::Result<()> {
+    let mut run_start = None;
+    for (index, page) in data.chunks(SNAPSHOT_SPARSE_PAGE_SIZE).enumerate() {
+        let pos = index * SNAPSHOT_SPARSE_PAGE_SIZE;
+        if !is_zero(page) {
+            run_start.get_or_insert(pos);
+        } else if let Some(start) = run_start.take() {
+            file.write_all_at(&data[start..pos], offset + start as u64)?;
+        }
+    }
+    if let Some(start) = run_start {
+        file.write_all_at(&data[start..], offset + start as u64)?;
+    }
+    Ok(())
 }
 
 /// A fault whose seek+read+copy completed but took at least this long is
@@ -907,7 +939,9 @@ impl MemoryManager {
     /// blocks restore for hundreds of milliseconds at multi-GB sizes), this
     /// registers the guest memory regions with a userfaultfd. A background
     /// thread handles page faults by reading the corresponding page from the
-    /// snapshot file and copying it into guest memory via `UFFDIO_COPY`.
+    /// snapshot file and copying it into guest memory via `UFFDIO_COPY`. An
+    /// all-zero page is mapped with `UFFDIO_ZEROPAGE` instead, so holes in a
+    /// sparse snapshot cost no host memory until the guest writes to them.
     ///
     /// This preserves the original memory mapping type (anonymous or shared),
     /// making it compatible with VFIO device passthrough and shared-memory
@@ -989,6 +1023,7 @@ impl MemoryManager {
                 length: range.length,
                 file_offset,
                 page_size: range_page_size,
+                zeropage: ioctls & crate::userfaultfd::UFFD_API_RANGE_IOCTL_ZEROPAGE != 0,
             });
 
             file_offset += range.length;
@@ -1268,15 +1303,24 @@ impl MemoryManager {
 
                     snapshot_file.seek(SeekFrom::Start(file_pos))?;
                     snapshot_file.read_exact(&mut page_buf[..range.page_size as usize])?;
+                    // An all-zero page (a hole in a sparse snapshot reads back without
+                    // disk I/O) maps the shared zero page instead of allocating a copy.
+                    let zero_fill =
+                        range.zeropage && is_zero(&page_buf[..range.page_size as usize]);
 
                     let mut eagain_spins: u64 = 0;
                     loop {
-                        match uffd::copy(
-                            uffd_fd.as_fd(),
-                            page_addr,
-                            page_buf.as_ptr(),
-                            range.page_size,
-                        ) {
+                        let resolved = if zero_fill {
+                            uffd::zeropage(uffd_fd.as_fd(), page_addr, range.page_size)
+                        } else {
+                            uffd::copy(
+                                uffd_fd.as_fd(),
+                                page_addr,
+                                page_buf.as_ptr(),
+                                range.page_size,
+                            )
+                        };
+                        match resolved {
                             Ok(()) => {
                                 pages_served += 1;
                                 state.pages_served.store(pages_served, Ordering::Relaxed);
@@ -1296,7 +1340,7 @@ impl MemoryManager {
                                 eagain_spins += 1;
                                 if eagain_spins % UFFD_EAGAIN_WARN_SPINS == 0 {
                                     warn!(
-                                        "UFFDIO_COPY at {page_addr:#x} still EAGAIN after {eagain_spins} retries",
+                                        "UFFD fault resolution at {page_addr:#x} still EAGAIN after {eagain_spins} retries",
                                     );
                                 }
                                 thread::yield_now();
@@ -3159,7 +3203,7 @@ impl Transportable for MemoryManager {
         memory_file_path.push(String::from(SNAPSHOT_FILENAME));
 
         // Create the snapshot file for the entire memory
-        let mut memory_file = OpenOptions::new()
+        let memory_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
@@ -3168,27 +3212,33 @@ impl Transportable for MemoryManager {
 
         let guest_memory = self.guest_memory.memory();
 
+        // Size the file for every range up front and write only non-zero pages, so
+        // all-zero guest memory (including pages the balloon returned to the host)
+        // stays a hole. Restore reads holes back as zeros.
+        let total_length: u64 = self
+            .snapshot_memory_ranges
+            .regions()
+            .iter()
+            .map(|range| range.length)
+            .sum();
+        memory_file
+            .set_len(total_length)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+        let mut chunk = vec![0u8; SNAPSHOT_WRITE_CHUNK_SIZE];
+        let mut file_offset: u64 = 0;
         for range in self.snapshot_memory_ranges.regions() {
             let mut offset: u64 = 0;
-            // Here we are manually handling the retry in case we can't read
-            // the whole region at once because we can't use the implementation
-            // from vm-memory::GuestMemory of write_all_to() as it is not
-            // following the correct behavior. For more info about this issue
-            // see: https://github.com/rust-vmm/vm-memory/issues/174
-            loop {
-                let bytes_written = guest_memory
-                    .write_volatile_to(
-                        GuestAddress(range.gpa + offset),
-                        &mut memory_file,
-                        (range.length - offset) as usize,
-                    )
+            while offset < range.length {
+                let len = (range.length - offset).min(SNAPSHOT_WRITE_CHUNK_SIZE as u64) as usize;
+                guest_memory
+                    .read_slice(&mut chunk[..len], GuestAddress(range.gpa + offset))
                     .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                offset += bytes_written as u64;
-
-                if offset == range.length {
-                    break;
-                }
+                write_nonzero_pages(&memory_file, file_offset + offset, &chunk[..len])
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                offset += len as u64;
             }
+            file_offset += range.length;
         }
         Ok(())
     }
@@ -3261,5 +3311,46 @@ impl Migratable for MemoryManager {
             table.extend(sub_table);
         }
         Ok(table)
+    }
+}
+
+#[cfg(test)]
+mod sparse_snapshot_tests {
+    use std::os::unix::io::AsRawFd;
+
+    use vmm_sys_util::tempfile::TempFile;
+
+    use super::*;
+
+    #[test]
+    fn write_nonzero_pages_leaves_zero_pages_as_holes() {
+        const PAGE: usize = SNAPSHOT_SPARSE_PAGE_SIZE;
+        // Pages: zero, data, data, zero, partial data page.
+        let mut data = vec![0u8; 4 * PAGE + 100];
+        data[PAGE] = 1;
+        data[3 * PAGE - 1] = 2;
+        data[4 * PAGE + 99] = 3;
+        assert!(is_zero(&data[..PAGE]));
+        assert!(!is_zero(&data[PAGE..2 * PAGE]));
+
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(data.len() as u64).unwrap();
+        write_nonzero_pages(&file, 0, &data).unwrap();
+
+        let mut read_back = vec![0xffu8; data.len()];
+        file.read_exact_at(&mut read_back, 0).unwrap();
+        assert_eq!(read_back, data);
+
+        // SAFETY: lseek on a valid fd with valid arguments.
+        let first_data = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_DATA) };
+        assert_eq!(first_data, PAGE as i64, "leading zero page must be a hole");
+        // SAFETY: lseek on a valid fd with valid arguments.
+        let hole_after_data =
+            unsafe { libc::lseek(file.as_raw_fd(), PAGE as i64, libc::SEEK_HOLE) };
+        assert_eq!(
+            hole_after_data,
+            3 * PAGE as i64,
+            "zero page after data must be a hole"
+        );
     }
 }
