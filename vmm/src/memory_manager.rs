@@ -1181,6 +1181,7 @@ impl MemoryManager {
 
         let total_pages: u64 = ranges.iter().map(|r| r.length.div_ceil(r.page_size)).sum();
         let mut pages_served: u64 = 0;
+        let mut page_ever_served = vec![false; total_pages as usize];
         let mut last_fault_completed: Option<Instant> = None;
 
         const EVENT_STOP: u64 = 0;
@@ -1293,11 +1294,13 @@ impl MemoryManager {
             state.begin_fault(fault_addr);
 
             let mut served = false;
+            let mut range_first_page: u64 = 0;
             for range in ranges {
                 // Round down to the page boundary containing the faulted address.
                 let page_addr = fault_addr & !(range.page_size - 1);
                 if page_addr >= range.host_addr && page_addr < range.host_addr + range.length {
                     let offset_in_range = page_addr - range.host_addr;
+                    let page_index = (range_first_page + offset_in_range / range.page_size) as usize;
                     let file_pos = range.file_offset + offset_in_range;
                     state.fault_file_offset.store(file_pos, Ordering::Relaxed);
 
@@ -1322,8 +1325,14 @@ impl MemoryManager {
                         };
                         match resolved {
                             Ok(()) => {
-                                pages_served += 1;
-                                state.pages_served.store(pages_served, Ordering::Relaxed);
+                                // A page the balloon discarded faults again; only its first
+                                // fill counts, or the handler exits with pages never served
+                                // and their next touch maps a zero page over guest memory.
+                                if !page_ever_served[page_index] {
+                                    page_ever_served[page_index] = true;
+                                    pages_served += 1;
+                                    state.pages_served.store(pages_served, Ordering::Relaxed);
+                                }
                                 break;
                             }
                             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
@@ -1351,6 +1360,7 @@ impl MemoryManager {
                     served = true;
                     break;
                 }
+                range_first_page += range.length.div_ceil(range.page_size);
             }
 
             state.end_fault();
